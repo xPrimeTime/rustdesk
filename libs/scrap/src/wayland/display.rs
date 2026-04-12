@@ -127,6 +127,11 @@ fn try_kscreen_primary() -> Option<String> {
 }
 
 fn try_gdbus_primary() -> Option<String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if !desktop.to_ascii_lowercase().contains("gnome") {
+        return None;
+    }
+
     let output = run_with_timeout(
         "gdbus",
         &[

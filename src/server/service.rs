@@ -272,7 +272,11 @@ impl<T: Subscriber + From<ConnInner>> ServiceTmpl<T> {
                         state.init();
                     }
                     if let Err(err) = callback(sp.clone(), &mut state) {
-                        log::error!("Error of {} service: {}", sp.name(), err);
+                        if err.to_string() == "SWITCH" {
+                            log::info!("{} service requested switch", sp.name());
+                        } else {
+                            log::error!("Error of {} service: {}", sp.name(), err);
+                        }
                         thread::sleep(time::Duration::from_millis(MAX_ERROR_TIMEOUT));
                         #[cfg(windows)]
                         crate::platform::windows::try_change_desktop();
@@ -305,7 +309,11 @@ impl<T: Subscriber + From<ConnInner>> ServiceTmpl<T> {
                     log::debug!("Enter {} service inner loop", sp.name());
                     let tm = time::Instant::now();
                     if let Err(err) = callback(sp.clone()) {
-                        log::error!("Error of {} service: {}", sp.name(), err);
+                        if err.to_string() == "SWITCH" {
+                            log::info!("{} service requested switch", sp.name());
+                        } else {
+                            log::error!("Error of {} service: {}", sp.name(), err);
+                        }
                         if tm.elapsed() > time::Duration::from_millis(MAX_ERROR_TIMEOUT) {
                             error_timeout = HIBERNATE_TIMEOUT;
                         } else {

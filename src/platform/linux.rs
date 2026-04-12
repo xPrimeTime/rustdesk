@@ -550,6 +550,15 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
             if !desktop.dbus.is_empty() {
                 envs.push(("DBUS_SESSION_BUS_ADDRESS", desktop.dbus.clone()));
             }
+            if !desktop.current_desktop.is_empty() {
+                envs.push(("XDG_CURRENT_DESKTOP", desktop.current_desktop.clone()));
+            }
+            if !desktop.hyprland_instance_signature.is_empty() {
+                envs.push((
+                    "HYPRLAND_INSTANCE_SIGNATURE",
+                    desktop.hyprland_instance_signature.clone(),
+                ));
+            }
             envs.push((
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
@@ -973,56 +982,45 @@ where
     }
 
     let xdg = &format!("XDG_RUNTIME_DIR=/run/user/{uid}");
-    if *SUDO_E_PRESERVES_ENV {
-        // Original logic: use sudo -E to preserve environment
-        let mut args = vec![xdg, "-u", &username, cmd.to_str().unwrap_or("")];
-        args.append(&mut arg.clone());
-        // -E is required to preserve env
-        args.insert(0, "-E");
-        let task = Command::new("sudo").envs(envs).args(args).spawn()?;
-        Ok(Some(task))
-    } else {
-        // Fallback: sudo -u username env VAR=VALUE ... cmd args
-        // For systems where sudo -E is not supported (e.g., Ubuntu 25.10+)
-        //
-        // SECURITY: No shell is involved here (we use execve-style argv).
-        // Environment is passed via `env` arguments,
-        // so there is no shell injection vector.
-        //
-        // Only accept portable env var names (POSIX portable character set for shells).
-        // Most legitimate env vars follow [A-Za-z_][A-Za-z0-9_]* convention.
-        // Variables with dots (e.g., "java.home") are Java system properties, not env vars.
-        // Being restrictive here is intentional for security in this sudo context.
-        fn is_valid_env_key(key: &str) -> bool {
-            let mut it = key.chars();
-            match it.next() {
-                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-                _ => return false,
-            }
-            it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    // Use explicit `env KEY=VALUE ...` under sudo instead of relying on `sudo -E`.
+    // In some Wayland sessions, `sudo -E` preserves too little of the discovered
+    // desktop environment, which drops `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS`
+    // and breaks portal access for the spawned `--server`.
+    //
+    // SECURITY: No shell is involved here (we use execve-style argv).
+    // Environment is passed via `env` arguments, so there is no shell injection vector.
+    //
+    // Only accept portable env var names (POSIX portable character set for shells).
+    // Most legitimate env vars follow [A-Za-z_][A-Za-z0-9_]* convention.
+    // Variables with dots (e.g., "java.home") are Java system properties, not env vars.
+    // Being restrictive here is intentional for security in this sudo context.
+    fn is_valid_env_key(key: &str) -> bool {
+        let mut it = key.chars();
+        match it.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
         }
-
-        let mut sudo = Command::new("sudo");
-        sudo.arg("-u").arg(&username).arg("--").arg("env").arg(xdg);
-
-        for (k, v) in envs {
-            let key = k.as_ref().to_string_lossy();
-            if !is_valid_env_key(&key) {
-                log::warn!("Skipping environment variable with invalid key: '{}'. Only [A-Za-z_][A-Za-z0-9_]* are allowed in sudo context.", key);
-                continue;
-            }
-            // IMPORTANT: do NOT add shell quotes here; `Command` does not invoke a shell.
-            // Passing KEY=VALUE as a single argv element is safe and preserves spaces.
-            let mut arg = OsString::from(&*key);
-            arg.push("=");
-            arg.push(v.as_ref());
-            sudo.arg(arg);
-        }
-
-        sudo.arg(cmd).args(arg);
-        let task = sudo.spawn()?;
-        Ok(Some(task))
+        it.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
+
+    let mut sudo = Command::new("sudo");
+    sudo.arg("-u").arg(&username).arg("--").arg("env").arg(xdg);
+
+    for (k, v) in envs {
+        let key = k.as_ref().to_string_lossy();
+        if !is_valid_env_key(&key) {
+            log::warn!("Skipping environment variable with invalid key: '{}'. Only [A-Za-z_][A-Za-z0-9_]* are allowed in sudo context.", key);
+            continue;
+        }
+        let mut arg = OsString::from(&*key);
+        arg.push("=");
+        arg.push(v.as_ref());
+        sudo.arg(arg);
+    }
+
+    sudo.arg(cmd).args(arg);
+    let task = sudo.spawn()?;
+    Ok(Some(task))
 }
 
 pub fn get_pa_monitor() -> String {
@@ -1503,6 +1501,7 @@ mod desktop {
     const ENV_KEY_XAUTHORITY: &str = "XAUTHORITY";
     const ENV_KEY_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
     const ENV_KEY_DBUS_SESSION_BUS_ADDRESS: &str = "DBUS_SESSION_BUS_ADDRESS";
+    const ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE: &str = "HYPRLAND_INSTANCE_SIGNATURE";
 
     #[derive(Debug, Clone, Default)]
     pub struct Desktop {
@@ -1516,6 +1515,8 @@ mod desktop {
         pub dbus: String,
         pub is_rustdesk_subprocess: bool,
         pub wl_display: String,
+        pub current_desktop: String,
+        pub hyprland_instance_signature: String,
     }
 
     impl Desktop {
@@ -1534,6 +1535,63 @@ mod desktop {
             self.sid.is_empty() || self.is_rustdesk_subprocess
         }
 
+        fn should_force_wayland(&self) -> bool {
+            let mut envs = get_envs(
+                &self.uid,
+                "Hyprland|xdg-desktop-portal(-hyprland)?",
+                &[
+                    ENV_KEY_WAYLAND_DISPLAY,
+                    ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                    ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE,
+                    XDG_CURRENT_DESKTOP,
+                ],
+            );
+
+            let wl_display = envs.remove(ENV_KEY_WAYLAND_DISPLAY).unwrap_or_default();
+            let dbus = envs
+                .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
+                .unwrap_or_default();
+            let hyprland_instance_signature = envs
+                .remove(ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE)
+                .unwrap_or_default();
+            let desktop = envs.remove(XDG_CURRENT_DESKTOP).unwrap_or_default();
+
+            !wl_display.is_empty()
+                && !dbus.is_empty()
+                && !hyprland_instance_signature.is_empty()
+                && desktop.to_ascii_lowercase().contains("hyprland")
+        }
+
+        fn get_wayland_session_markers(&mut self) {
+            let mut envs = get_envs(
+                &self.uid,
+                "Hyprland|xdg-desktop-portal(-hyprland)?",
+                &[
+                    ENV_KEY_WAYLAND_DISPLAY,
+                    ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                    ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE,
+                    XDG_CURRENT_DESKTOP,
+                ],
+            );
+
+            if self.wl_display.is_empty() {
+                self.wl_display = envs.remove(ENV_KEY_WAYLAND_DISPLAY).unwrap_or_default();
+            }
+            if self.dbus.is_empty() {
+                self.dbus = envs
+                    .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
+                    .unwrap_or_default();
+            }
+            if self.hyprland_instance_signature.is_empty() {
+                self.hyprland_instance_signature = envs
+                    .remove(ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE)
+                    .unwrap_or_default();
+            }
+            if self.current_desktop.is_empty() {
+                self.current_desktop = envs.remove(XDG_CURRENT_DESKTOP).unwrap_or_default();
+            }
+        }
+
         fn get_display_xauth_wayland(&mut self) {
             for _ in 1..=10 {
                 // Prefer Wayland-related variables first when multiple portal processes match.
@@ -1543,6 +1601,8 @@ mod desktop {
                     &[
                         ENV_KEY_WAYLAND_DISPLAY,
                         ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                        ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE,
+                        XDG_CURRENT_DESKTOP,
                         ENV_KEY_DISPLAY,
                         ENV_KEY_XAUTHORITY,
                     ],
@@ -1553,6 +1613,10 @@ mod desktop {
                 self.dbus = envs
                     .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
                     .unwrap_or_default();
+                self.hyprland_instance_signature = envs
+                    .remove(ENV_KEY_HYPRLAND_INSTANCE_SIGNATURE)
+                    .unwrap_or_default();
+                self.current_desktop = envs.remove(XDG_CURRENT_DESKTOP).unwrap_or_default();
                 // For pure Wayland sessions, prefer `WAYLAND_DISPLAY`.
                 // NOTE: On some systems (e.g. Ubuntu 25.10), `DISPLAY`/`XAUTHORITY` may exist even when XWayland
                 // is not running, so do NOT treat them as a success condition here.
@@ -1562,6 +1626,28 @@ mod desktop {
                     return;
                 }
                 sleep_millis(300);
+            }
+        }
+
+        fn ensure_wayland_session_env(&mut self) {
+            if !self.wl_display.is_empty()
+                && !self.dbus.is_empty()
+                && !self.current_desktop.is_empty()
+                && !self.hyprland_instance_signature.is_empty()
+            {
+                return;
+            }
+
+            let old_display = self.display.clone();
+            let old_xauth = self.xauth.clone();
+            self.get_display_xauth_wayland();
+            self.get_wayland_session_markers();
+
+            if self.display.is_empty() {
+                self.display = old_display;
+            }
+            if self.xauth.is_empty() {
+                self.xauth = old_xauth;
             }
         }
 
@@ -1582,6 +1668,9 @@ mod desktop {
                     self.wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
                     self.dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
                     if !self.display.is_empty() && !self.xauth.is_empty() {
+                        if self.is_wayland() {
+                            self.ensure_wayland_session_env();
+                        }
                         return;
                     }
                 }
@@ -1807,6 +1896,14 @@ mod desktop {
             self.uid = seat0_values[1].clone();
             self.username = seat0_values[2].clone();
             self.protocol = get_display_server_of_session(&self.sid).into();
+            if self.protocol != DISPLAY_SERVER_WAYLAND && self.should_force_wayland() {
+                log::info!(
+                    "Forcing Wayland session detection for user {} despite loginctl type '{}'",
+                    self.username,
+                    self.protocol
+                );
+                self.protocol = DISPLAY_SERVER_WAYLAND.to_owned();
+            }
             if self.is_login_wayland() {
                 self.display = "".to_owned();
                 self.xauth = "".to_owned();
@@ -2150,7 +2247,10 @@ pub fn clear_gnome_shortcuts_inhibitor_permission() -> ResultType<()> {
                 || err_name == "org.freedesktop.DBus.Error.UnknownObject"
                 || err_name == "org.freedesktop.DBus.Error.ServiceUnknown"
             {
-                log::info!("GNOME shortcuts inhibitor permission was not set ({})", err_name);
+                log::info!(
+                    "GNOME shortcuts inhibitor permission was not set ({})",
+                    err_name
+                );
                 Ok(())
             } else {
                 bail!("Failed to clear permission: {}", e)
