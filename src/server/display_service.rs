@@ -304,12 +304,14 @@ pub(super) fn get_display_info(idx: usize) -> Option<DisplayInfo> {
 // Display to DisplayInfo
 // The DisplayInfo is be sent to the peer.
 pub(super) fn check_update_displays(all: &Vec<Display>) {
-    // For compatibility: if only one display, scale remains 1.0 and we use the physical size for `uinput`.
-    // If there are multiple displays, we use the logical size for `uinput` by setting scale to d.scale().
     #[cfg(target_os = "linux")]
-    let use_logical_scale = !is_x11()
-        && crate::is_server()
-        && scrap::wayland::display::get_displays().displays.len() > 1;
+    let use_logical_scale = !is_x11() && crate::is_server();
+    #[cfg(target_os = "linux")]
+    let compositor_displays = if use_logical_scale {
+        Some(scrap::wayland::display::get_displays())
+    } else {
+        None
+    };
     let displays = all
         .iter()
         .map(|d| {
@@ -317,14 +319,42 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
             #[allow(unused_assignments)]
             #[allow(unused_mut)]
             let mut scale = 1.0;
+            let mut x = d.origin().0 as i32;
+            let mut y = d.origin().1 as i32;
             #[cfg(target_os = "macos")]
             {
                 scale = d.scale();
             }
             #[cfg(target_os = "linux")]
             {
-                if use_logical_scale {
+                if use_logical_scale && d.scale() > 0.0 {
                     scale = d.scale();
+                }
+                if let Some(compositor_displays) = &compositor_displays {
+                    let mut matched = compositor_displays
+                        .displays
+                        .iter()
+                        .filter(|wd| wd.width == d.width() as i32 && wd.height == d.height() as i32)
+                        .collect::<Vec<_>>();
+                    if matched.len() != 1 && scale > 0.0 {
+                        let logical_w = ((d.width() as f64) / scale).round() as i32;
+                        let logical_h = ((d.height() as f64) / scale).round() as i32;
+                        matched = compositor_displays
+                            .displays
+                            .iter()
+                            .filter(|wd| wd.logical_size == Some((logical_w, logical_h)))
+                            .collect::<Vec<_>>();
+                    }
+                    if matched.len() == 1 {
+                        let wd = matched[0];
+                        x = wd.x;
+                        y = wd.y;
+                        if let Some((logical_w, _logical_h)) = wd.logical_size {
+                            if logical_w > 0 {
+                                scale = d.width() as f64 / logical_w as f64;
+                            }
+                        }
+                    }
                 }
             }
             let original_resolution = get_original_resolution(
@@ -333,8 +363,8 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
                 (d.height() as f64 / scale).round() as usize,
             );
             DisplayInfo {
-                x: d.origin().0 as _,
-                y: d.origin().1 as _,
+                x,
+                y,
                 width: d.width() as _,
                 height: d.height() as _,
                 name: display_name,
