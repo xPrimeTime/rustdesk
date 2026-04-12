@@ -498,11 +498,31 @@ where
     })
 }
 
+fn get_sender_normalized(conn: &SyncConnection) -> String {
+    conn.unique_name().trim_start_matches(':').replace('.', "_")
+}
+
+fn get_request_path(
+    conn: &SyncConnection,
+    handle_token: &str,
+) -> Result<dbus::Path<'static>, dbus::Error> {
+    dbus::Path::new(format!(
+        "/org/freedesktop/portal/desktop/request/{}/{}",
+        get_sender_normalized(conn),
+        handle_token
+    ))
+    .map_err(|_| dbus::Error::new_failed("Failed to construct portal request path"))
+}
+
 pub fn get_portal(conn: &SyncConnection) -> Proxy<&SyncConnection> {
     conn.with_proxy(
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",
-        Duration::from_millis(1000),
+        // 30s timeout: portal method calls (CreateSession, SelectSources, Start) must
+        // return their request-path reply promptly per spec, but some compositors
+        // (e.g. xdg-desktop-portal-hyprland) can take longer on first call due to
+        // initialization overhead. The 1s default causes spurious NoReply errors.
+        Duration::from_secs(30),
     )
 }
 
@@ -590,6 +610,25 @@ const RESTORE_TOKEN: &str = "restore_token";
 const RESTORE_TOKEN_CONF_KEY: &str = "wayland-restore-token";
 const PIPEWIRE_DISPLAY_OFFSET_CONF_KEY: &str = "wayland-pipewire-display-offset";
 
+fn is_hyprland_session() -> bool {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        return true;
+    }
+
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|desktop| desktop.to_ascii_lowercase().contains("hyprland"))
+        .unwrap_or(false)
+}
+
+fn should_use_restore_token(is_support_restore_token: bool) -> bool {
+    is_support_restore_token && !is_hyprland_session()
+}
+
+fn clear_restore_token_state() {
+    config::LocalConfig::set_option(RESTORE_TOKEN_CONF_KEY.to_owned(), "".to_owned());
+    config::LocalConfig::set_option(PIPEWIRE_DISPLAY_OFFSET_CONF_KEY.to_owned(), "".to_owned());
+}
+
 pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
     let conn = SyncConnection::new_session()?;
     let portal = get_portal(&conn);
@@ -623,13 +662,14 @@ pub fn request_remote_desktop(
     let failure_res = failure.clone();
     let session: Arc<Mutex<Option<dbus::Path>>> = Arc::new(Mutex::new(None));
     let session_res = session.clone();
+    let create_session_handle_token = "u1";
     args.insert(
         "session_handle_token".to_string(),
-        Variant(Box::new("u1".to_string())),
+        Variant(Box::new(create_session_handle_token.to_string())),
     );
     args.insert(
         "handle_token".to_string(),
-        Variant(Box::new("u1".to_string())),
+        Variant(Box::new(create_session_handle_token.to_string())),
     );
 
     let mut is_support_restore_token = false;
@@ -638,6 +678,10 @@ pub fn request_remote_desktop(
             is_support_restore_token = true;
         }
     }
+    if is_server_running() && !should_use_restore_token(is_support_restore_token) {
+        debug!("Disabling Wayland restore token persistence for current session.");
+        clear_restore_token_state();
+    }
 
     // The following code may be improved.
     // https://flatpak.github.io/xdg-desktop-portal/#:~:text=To%20avoid%20a%20race%20condition
@@ -645,15 +689,9 @@ pub fn request_remote_desktop(
     // between the caller subscribing to the signal after receiving the reply for the method call and the signal getting emitted,
     // a convention for Request object paths has been established that allows
     // the caller to subscribe to the signal before making the method call.
-    let path;
-    if is_server_running() {
-        path = screencast_portal::create_session(&portal, args)?;
-    } else {
-        path = remote_desktop_portal::create_session(&portal, args)?;
-    }
     handle_response(
         &conn,
-        path,
+        get_request_path(&conn, create_session_handle_token)?,
         on_create_session_response(
             fd.clone(),
             streams.clone(),
@@ -664,6 +702,11 @@ pub fn request_remote_desktop(
         ),
         failure_res.clone(),
     )?;
+    if is_server_running() {
+        let _ = screencast_portal::create_session(&portal, args)?;
+    } else {
+        let _ = remote_desktop_portal::create_session(&portal, args)?;
+    }
 
     // wait 3 minutes for user interaction
     for _ in 0..1800 {
@@ -734,7 +777,8 @@ fn on_create_session_response(
         let mut args: PropMap = HashMap::new();
         // See `is_server_running()` to understand the following code.
         if is_server_running() {
-            if is_support_restore_token {
+            let select_sources_handle_token = "u3";
+            if should_use_restore_token(is_support_restore_token) {
                 let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
                 if !restore_token.is_empty() {
                     args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
@@ -744,7 +788,7 @@ fn on_create_session_response(
             }
             args.insert(
                 "handle_token".to_string(),
-                Variant(Box::new("u3".to_string())),
+                Variant(Box::new(select_sources_handle_token.to_string())),
             );
             // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html
             if is_server_running() {
@@ -760,42 +804,43 @@ fn on_create_session_response(
                 });
             }
 
-            let path = portal.select_sources(ses.clone(), args)?;
             handle_response(
                 c,
-                path,
+                get_request_path(c, select_sources_handle_token)?,
                 on_select_sources_response(
                     fd.clone(),
                     streams.clone(),
                     failure.clone(),
-                    ses,
+                    ses.clone(),
                     is_support_restore_token,
                 ),
                 failure.clone(),
             )?;
+            let _ = portal.select_sources(ses.clone(), args)?;
         } else {
             // TODO: support persist_mode for remote_desktop_portal
             // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html
 
+            let select_devices_handle_token = "u2";
             args.insert(
                 "handle_token".to_string(),
-                Variant(Box::new("u2".to_string())),
+                Variant(Box::new(select_devices_handle_token.to_string())),
             );
             args.insert("types".to_string(), Variant(Box::new(7u32)));
 
-            let path = portal.select_devices(ses.clone(), args)?;
             handle_response(
                 c,
-                path,
+                get_request_path(c, select_devices_handle_token)?,
                 on_select_devices_response(
                     fd.clone(),
                     streams.clone(),
                     failure.clone(),
-                    ses,
+                    ses.clone(),
                     is_support_restore_token,
                 ),
                 failure.clone(),
             )?;
+            let _ = portal.select_devices(ses.clone(), args)?;
         }
 
         Ok(())
@@ -816,9 +861,10 @@ fn on_select_devices_response(
     move |_: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
         let mut args: PropMap = HashMap::new();
+        let select_sources_handle_token = "u3";
         args.insert(
             "handle_token".to_string(),
-            Variant(Box::new("u3".to_string())),
+            Variant(Box::new(select_sources_handle_token.to_string())),
         );
         // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html
         if is_server_running() {
@@ -827,19 +873,19 @@ fn on_select_devices_response(
         args.insert("types".into(), Variant(Box::new(1u32))); //| 2u32)));
 
         let session = session.clone();
-        let path = portal.select_sources(session.clone(), args)?;
         handle_response(
             c,
-            path,
+            get_request_path(c, select_sources_handle_token)?,
             on_select_sources_response(
                 fd.clone(),
                 streams.clone(),
                 failure.clone(),
-                session,
+                session.clone(),
                 is_support_restore_token,
             ),
             failure.clone(),
         )?;
+        let _ = portal.select_sources(session.clone(), args)?;
 
         Ok(())
     }
@@ -859,19 +905,20 @@ fn on_select_sources_response(
     move |_: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
         let mut args: PropMap = HashMap::new();
+        let handle_token = "u4";
         args.insert(
             "handle_token".to_string(),
-            Variant(Box::new("u4".to_string())),
+            Variant(Box::new(handle_token.to_string())),
         );
-        let path;
-        if is_server_running() {
-            path = screencast_portal::start(&portal, session.clone(), "", args)?;
-        } else {
-            path = remote_desktop_portal::start(&portal, session.clone(), "", args)?;
-        }
+
+        // Pre-subscribe to the Start response BEFORE calling portal.start() to avoid
+        // a race condition with fast compositors like Hyprland that respond immediately
+        // (before we can register the match rule). The portal spec guarantees the
+        // response path is predictable:
+        // /org/freedesktop/portal/desktop/request/{sender_normalized}/{handle_token}
         handle_response(
             c,
-            path,
+            get_request_path(c, handle_token)?,
             on_start_response(
                 fd.clone(),
                 streams.clone(),
@@ -880,6 +927,14 @@ fn on_select_sources_response(
             ),
             failure.clone(),
         )?;
+
+        // Call Start AFTER subscribing to avoid missing the response signal on
+        // compositors (e.g. Hyprland) that reply before we can register the match rule.
+        if is_server_running() {
+            screencast_portal::start(&portal, session.clone(), "", args)?;
+        } else {
+            remote_desktop_portal::start(&portal, session.clone(), "", args)?;
+        }
 
         Ok(())
     }
@@ -899,7 +954,7 @@ fn on_start_response(
         let portal = get_portal(c);
         // See `is_server_running()` to understand the following code.
         if is_server_running() {
-            if is_support_restore_token {
+            if should_use_restore_token(is_support_restore_token) {
                 if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
                     if let Some(restore_token) = restore_token.as_str() {
                         config::LocalConfig::set_option(
@@ -908,14 +963,25 @@ fn on_start_response(
                         );
                     }
                 }
+            } else {
+                clear_restore_token_state();
             }
         }
 
+        let mut response_streams = streams_from_response(r);
+        debug!(
+            "Portal start response returned {} stream(s): {:?}",
+            response_streams.len(),
+            response_streams
+                .iter()
+                .map(|stream| (stream.path.to_string(), stream.size, stream.position))
+                .collect::<Vec<_>>()
+        );
         streams
             .clone()
             .lock()
             .unwrap()
-            .append(&mut streams_from_response(r));
+            .append(&mut response_streams);
         fd.clone()
             .lock()
             .unwrap()
@@ -1108,6 +1174,9 @@ fn try_fill_positions(
     shared_displays: &mut Vec<crate::Display>,
     streams: &mut Vec<PwStreamInfo>,
 ) -> ResultType<()> {
+    if is_hyprland_session() {
+        config::LocalConfig::set_option(PIPEWIRE_DISPLAY_OFFSET_CONF_KEY.to_owned(), "".to_owned());
+    }
     let pipewire_display_offset = config::LocalConfig::get_option(PIPEWIRE_DISPLAY_OFFSET_CONF_KEY);
     if !pipewire_display_offset.is_empty() {
         if try_fill_positions_from_cache(
@@ -1507,6 +1576,8 @@ fn sort_streams(
         }
     }
 
+    let original_stream_count = streams.len();
+    let original_display_count = shared_displays.len();
     let mut sorted_streams = Vec::new();
     let mut sorted_shared_displays = Vec::new();
     // Move matching items in order without cloning
@@ -1522,6 +1593,19 @@ fn sort_streams(
                 break;
             }
         }
+    }
+    if sorted_streams.is_empty()
+        || sorted_streams.len() != original_stream_count
+        || sorted_shared_displays.len() != original_display_count
+    {
+        debug!(
+            "Skipping stream sort due to partial position match: sorted_streams={}, streams={}, sorted_displays={}, displays={}",
+            sorted_streams.len(),
+            original_stream_count,
+            sorted_shared_displays.len(),
+            original_display_count
+        );
+        return;
     }
     *streams = sorted_streams;
     *shared_displays = sorted_shared_displays;

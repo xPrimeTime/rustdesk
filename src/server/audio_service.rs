@@ -96,20 +96,13 @@ mod pa_impl {
         hbb_common::sleep(0.1).await; // one moment to wait for _pa ipc
         RESTARTING.store(false, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
-        let mut stream = crate::ipc::connect(1000, "_pa").await?;
+        let mut stream = None;
+        #[cfg(target_os = "linux")]
+        let mut audio_unavailable_logged = false;
         unsafe {
             AUDIO_ZERO_COUNT = 0;
         }
         let mut encoder = Encoder::new(crate::platform::PA_SAMPLE_RATE, Stereo, LowDelay)?;
-        #[cfg(target_os = "linux")]
-        allow_err!(
-            stream
-                .send(&crate::ipc::Data::Config((
-                    "audio-input".to_owned(),
-                    Some(super::get_audio_input())
-                )))
-                .await
-        );
         #[cfg(target_os = "linux")]
         let zero_audio_frame: Vec<f32> = vec![0.; AUDIO_DATA_SIZE_U8 / 4];
         #[cfg(target_os = "android")]
@@ -121,21 +114,56 @@ mod pa_impl {
             })?;
 
             #[cfg(target_os = "linux")]
-            if let Ok(data) = stream.next_raw().await {
-                if data.len() == 0 {
-                    send_f32(&zero_audio_frame, &mut encoder, &sp);
-                    continue;
+            {
+                if stream.is_none() {
+                    match crate::ipc::connect(1000, "_pa").await {
+                        Ok(mut conn) => {
+                            allow_err!(
+                                conn.send(&crate::ipc::Data::Config((
+                                    "audio-input".to_owned(),
+                                    Some(super::get_audio_input())
+                                )))
+                                .await
+                            );
+                            stream = Some(conn);
+                            audio_unavailable_logged = false;
+                        }
+                        Err(err) => {
+                            if !audio_unavailable_logged {
+                                log::warn!("Audio backend unavailable, disabling audio retry spam: {}", err);
+                                audio_unavailable_logged = true;
+                            }
+                            hbb_common::sleep(1.0).await;
+                            continue;
+                        }
+                    }
                 }
 
-                if data.len() != AUDIO_DATA_SIZE_U8 {
+                let Some(conn) = stream.as_mut() else {
+                    hbb_common::sleep(1.0).await;
                     continue;
-                }
-
-                let data = unsafe { align_to_32(data.into()) };
-                let data = unsafe {
-                    std::slice::from_raw_parts::<f32>(data.as_ptr() as _, data.len() / 4)
                 };
-                send_f32(data, &mut encoder, &sp);
+
+                if let Ok(data) = conn.next_raw().await {
+                    if data.len() == 0 {
+                        send_f32(&zero_audio_frame, &mut encoder, &sp);
+                        continue;
+                    }
+
+                    if data.len() != AUDIO_DATA_SIZE_U8 {
+                        continue;
+                    }
+
+                    let data = unsafe { align_to_32(data.into()) };
+                    let data = unsafe {
+                        std::slice::from_raw_parts::<f32>(data.as_ptr() as _, data.len() / 4)
+                    };
+                    send_f32(data, &mut encoder, &sp);
+                } else {
+                    log::warn!("Audio backend disconnected, will retry.");
+                    stream = None;
+                    hbb_common::sleep(1.0).await;
+                }
             }
 
             #[cfg(target_os = "android")]

@@ -279,7 +279,7 @@ pub struct Connection {
     last_supported_encoding: Option<SupportedEncoding>,
     services_subed: bool,
     delayed_read_dir: Option<(String, bool)>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     retina: Retina,
     follow_remote_cursor: bool,
     follow_remote_window: bool,
@@ -468,7 +468,7 @@ impl Connection {
             last_supported_encoding: None,
             services_subed: false,
             delayed_read_dir: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             retina: Retina::default(),
             tx_from_authed,
             printer_data: Vec::new(),
@@ -1670,7 +1670,7 @@ impl Connection {
                 Ok(displays) => {
                     // For compatibility with old versions, we need to send the displays to the peer.
                     // But the displays may be updated later, before creating the video capturer.
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     {
                         self.retina.set_displays(&displays);
                     }
@@ -2131,7 +2131,7 @@ impl Connection {
                 )
                 .await
                 {
-                    log::warn!("ipc to connection manager exit: {}", err);
+                    log::info!("ipc to connection manager exit: {}", err);
                     // https://github.com/rustdesk/rustdesk-server-pro/discussions/382#discussioncomment-10525725, cm may start failed
                     #[cfg(windows)]
                     if !crate::platform::is_prelogin()
@@ -2460,7 +2460,7 @@ impl Connection {
                         } else {
                             MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
                         }
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
                         self.input_mouse(
                             me,
@@ -2471,7 +2471,7 @@ impl Connection {
                             self.show_my_cursor,
                         );
                     } else if self.show_my_cursor {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
                         self.input_mouse(
                             me,
@@ -5221,13 +5221,13 @@ extern "C" fn connection_shutdown_hook() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct Retina {
     displays: Vec<DisplayInfo>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Retina {
     #[inline]
     fn set_displays(&mut self, displays: &Vec<DisplayInfo>) {
@@ -5249,9 +5249,63 @@ impl Retina {
             return;
         };
         let s = d.scale;
-        if s > 1.0 && e.x >= d.x && e.y >= d.y && e.x < d.x + d.width && e.y < d.y + d.height {
-            e.x = d.x + ((e.x - d.x) as f64 / s) as i32;
-            e.y = d.y + ((e.y - d.y) as f64 / s) as i32;
+        let origin = (d.x, d.y);
+        let logical_w = if s > 1.0 {
+            (d.width as f64 / s).round() as i32
+        } else {
+            d.width
+        };
+        let logical_h = if s > 1.0 {
+            (d.height as f64 / s).round() as i32
+        } else {
+            d.height
+        };
+        let in_global_physical_bounds = e.x >= origin.0
+            && e.y >= origin.1
+            && e.x < origin.0 + d.width
+            && e.y < origin.1 + d.height;
+        let in_global_logical_bounds = e.x >= origin.0
+            && e.y >= origin.1
+            && e.x < origin.0 + logical_w
+            && e.y < origin.1 + logical_h;
+
+        // On Wayland/Hyprland a single selected monitor is often encoded with
+        // monitor-local coordinates while uinput still expects global desktop
+        // coordinates. Promote local coordinates into the display's global
+        // space before applying scale conversion.
+        #[cfg(target_os = "linux")]
+        if origin != (0, 0) {
+            if !in_global_physical_bounds && e.x >= 0 && e.y >= 0 && e.x < d.width && e.y < d.height {
+                // Selected-monitor remote sessions deliver coordinates in the
+                // captured stream's pixel space. Promote them into global
+                // desktop space by applying only the monitor origin here.
+                // Applying `scale` again would incorrectly shrink HiDPI
+                // monitors into a smaller center region.
+                e.x += origin.0;
+                e.y += origin.1;
+                return;
+            }
+            if !in_global_logical_bounds
+                && e.x >= 0
+                && e.y >= 0
+                && e.x < logical_w
+                && e.y < logical_h
+            {
+                e.x += origin.0;
+                e.y += origin.1;
+                return;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if s > 1.0
+            && e.x >= origin.0
+            && e.y >= origin.1
+            && e.x < origin.0 + d.width
+            && e.y < origin.1 + d.height
+        {
+            e.x = origin.0 + ((e.x - origin.0) as f64 / s) as i32;
+            e.y = origin.1 + ((e.y - origin.1) as f64 / s) as i32;
         }
     }
 
