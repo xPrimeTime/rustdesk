@@ -961,13 +961,9 @@ async fn handle_fs(
                 file_num,
                 false,
                 false,
+                file_entries,
                 overwrite_detection,
             );
-            if let Err(e) = job.set_files(file_entries) {
-                log::warn!("Reject unsafe transfer file list for {}: {}", path, e);
-                send_raw(fs::new_error(id, e, file_num), tx);
-                return;
-            }
             job.total_size = total_size;
             job.conn_id = conn_id;
             write_jobs.push(job);

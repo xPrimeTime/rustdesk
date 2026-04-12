@@ -586,6 +586,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         file_num,
                         include_hidden,
                         is_remote,
+                        Vec::new(),
                         od,
                     ));
                     allow_err!(
@@ -658,6 +659,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         file_num,
                         include_hidden,
                         is_remote,
+                        Vec::new(),
                         od,
                     );
                     job.is_last_job = true;
@@ -1472,24 +1474,17 @@ impl<T: InvokeUiSession> Remote<T> {
                                     fs::transform_windows_path(&mut entries);
                                 }
                             }
-                            // We cannot call cancel_transfer_job/handle_job_status while holding
-                            // a mutable borrow from fs::get_job(&mut self.write_jobs), so defer
-                            // the error handling until after the borrow scope ends.
-                            let mut set_files_err = None;
                             if let Some(job) = fs::get_job(fd.id, &mut self.write_jobs) {
                                 log::info!("job set_files: {:?}", entries);
-                                if let Err(err) = job.set_files(entries) {
-                                    set_files_err = Some(err.to_string());
-                                } else {
-                                    job.set_finished_size_on_resume();
-                                    self.handler.update_folder_files(
-                                        fd.id,
-                                        job.files(),
-                                        fd.path,
-                                        false,
-                                        false,
-                                    );
-                                }
+                                job.set_files(entries);
+                                job.set_finished_size_on_resume();
+                                self.handler.update_folder_files(
+                                    fd.id,
+                                    job.files(),
+                                    fd.path,
+                                    false,
+                                    false,
+                                );
                             } else if let Some(job) = self.remove_jobs.get_mut(&fd.id) {
                                 // Intentionally keep raw entries here:
                                 // - remote remove flow executes deletions on peer side;
@@ -1500,15 +1495,6 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 self.handler
                                     .update_folder_files(fd.id, &entries, fd.path, false, false);
-                            }
-                            if let Some(err) = set_files_err {
-                                log::warn!(
-                                    "Rejected unsafe file list from remote peer for job {}: {}",
-                                    fd.id,
-                                    err
-                                );
-                                self.cancel_transfer_job(fd.id, peer).await;
-                                self.handle_job_status(fd.id, -1, Some(err));
                             }
                         }
                         Some(file_response::Union::Digest(digest)) => {

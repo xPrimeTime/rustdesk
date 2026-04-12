@@ -27,7 +27,6 @@ use hbb_common::platform::linux::run_cmds;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
-    config::decode_permanent_password_h1_from_storage,
     config::{self, keys, Config, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
@@ -2012,7 +2011,7 @@ impl Connection {
 
         // Use strict decode success to detect hashed storage.
         // If decode fails, treat as legacy plaintext storage for compatibility.
-        if let Some(h1) = decode_permanent_password_h1_from_storage(storage) {
+        if let Some(h1) = Config::decode_permanent_password_h1_from_storage(storage) {
             return self.verify_h1(&h1[..]);
         }
 

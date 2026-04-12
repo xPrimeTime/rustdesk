@@ -1124,20 +1124,34 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
     format!("{}/api/audit/{}", url, typ)
 }
 
+#[derive(Debug, Default, Clone)]
+struct HeaderEntry {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct HttpProxyResponse {
+    status: u16,
+    headers: Vec<HeaderEntry>,
+    body: Bytes,
+    error: String,
+}
+
 /// Check if we should use raw TCP proxy for API calls.
 /// Returns true if USE_RAW_TCP_FOR_API builtin option is "Y", WebSocket is off,
 /// and the target URL belongs to the configured non-public API host.
 #[inline]
 fn should_use_raw_tcp_for_api(url: &str) -> bool {
-    get_builtin_option(keys::OPTION_USE_RAW_TCP_FOR_API) == "Y"
-        && !use_ws()
-        && is_tcp_proxy_api_target(url)
+    let _ = url;
+    false
 }
 
 /// Check if we can attempt raw TCP proxy fallback for this target URL.
 #[inline]
 fn can_fallback_to_raw_tcp(url: &str) -> bool {
-    !use_ws() && is_tcp_proxy_api_target(url)
+    let _ = url;
+    false
 }
 
 #[inline]
@@ -1198,54 +1212,8 @@ async fn tcp_proxy_request(
     body: &[u8],
     headers: Vec<HeaderEntry>,
 ) -> ResultType<HttpProxyResponse> {
-    let tcp_addr = get_tcp_proxy_addr();
-    if tcp_addr.is_empty() {
-        bail!("No rendezvous server configured for TCP proxy");
-    }
-
-    let parsed = url::Url::parse(url)?;
-    let path = if let Some(query) = parsed.query() {
-        format!("{}?{}", parsed.path(), query)
-    } else {
-        parsed.path().to_string()
-    };
-
-    log::debug!(
-        "Sending {} {} via TCP proxy to {}",
-        method,
-        parsed.path(),
-        tcp_addr
-    );
-
-    let overall_timeout = CONNECT_TIMEOUT + READ_TIMEOUT;
-    timeout(overall_timeout, async {
-        let mut conn = socket_client::connect_tcp(&*tcp_addr, CONNECT_TIMEOUT).await?;
-        let key = crate::get_key(true).await;
-        secure_tcp_silent(&mut conn, &key).await?;
-
-        let mut req = HttpProxyRequest::new();
-        req.method = method.to_uppercase();
-        req.path = path;
-        req.headers = headers.into();
-        req.body = Bytes::from(body.to_vec());
-
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_http_proxy_request(req);
-        conn.send(&msg_out).await?;
-
-        match conn.next().await {
-            Some(Ok(bytes)) => {
-                let msg_in = RendezvousMessage::parse_from_bytes(&bytes)?;
-                match msg_in.union {
-                    Some(rendezvous_message::Union::HttpProxyResponse(resp)) => Ok(resp),
-                    _ => bail!("Unexpected response from TCP proxy"),
-                }
-            }
-            Some(Err(e)) => bail!("TCP proxy read error: {}", e),
-            None => bail!("TCP proxy connection closed without response"),
-        }
-    })
-    .await?
+    let _ = (method, url, body, headers);
+    bail!("TCP proxy API is unavailable in this upstream branch")
 }
 
 /// Build HeaderEntry list from "Key: Value" style header string (used by post_request).
