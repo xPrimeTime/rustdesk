@@ -88,7 +88,14 @@ pub fn try_close_session() {
     let mut close = false;
     if let Some(rdp_info) = &*rdp_info {
         // If is server running and restore token is supported, there's no need to keep the session.
-        if is_server_running() && rdp_info.is_support_restore_token {
+        //
+        // Option A (Hyprland re-auth fix): restore tokens are disabled on Hyprland
+        // (see `should_use_restore_token`), so dropping the session here would force a
+        // fresh portal auth prompt on the next reconnect — impossible to approve when
+        // away from the machine. Keep the session alive for the whole process lifetime
+        // on Hyprland so reconnects reuse it. Trade-off: capture stays "active" while
+        // idle, and it does not survive a RustDesk restart.
+        if is_server_running() && rdp_info.is_support_restore_token && !is_hyprland_session() {
             close = true;
         }
     }
