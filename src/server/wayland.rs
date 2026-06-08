@@ -1,9 +1,9 @@
 use super::*;
-use hbb_common::{allow_err, anyhow, platform::linux::DISTRO};
+use hbb_common::{allow_err, platform::linux::DISTRO};
 use scrap::{
     is_cursor_embedded, set_map_err,
-    wayland::pipewire::{fill_displays, try_fix_logical_size},
-    Capturer, Display, Frame, TraitCapturer,
+    wayland::pipewire::{fill_displays, is_hyprland_session, try_fix_logical_size},
+    Capturer, Display,
 };
 use std::collections::HashMap;
 use std::io;
@@ -38,6 +38,10 @@ pub(super) fn decrement_active_display_count() -> usize {
         *count -= 1;
     }
     *count
+}
+
+pub(super) fn active_display_count() -> usize {
+    *ACTIVE_DISPLAY_COUNT.read().unwrap()
 }
 
 fn map_err_scrap(err: String) -> io::Error {
@@ -78,27 +82,13 @@ fn try_log(err: &String) {
     *lock_count += 1;
 }
 
-struct CapturerPtr(*mut Capturer);
-
-impl Clone for CapturerPtr {
-    fn clone(&self) -> Self {
-        Self(self.0)
-    }
-}
-
-impl TraitCapturer for CapturerPtr {
-    fn frame<'a>(&'a mut self, timeout: std::time::Duration) -> std::io::Result<Frame<'a>> {
-        unsafe { (*self.0).frame(timeout) }
-    }
-}
-
 struct CapDisplayInfo {
     rects: Vec<((i32, i32), usize, usize)>,
     displays: Vec<DisplayInfo>,
     num: usize,
     primary: usize,
     current: usize,
-    capturer: CapturerPtr,
+    display: Display,
 }
 
 fn align_display_infos_to_rects(
@@ -186,6 +176,17 @@ fn get_desktop_rect_from_displays(displays: &[Display]) -> Option<(i32, i32, i32
     Some((min_x, max_x, min_y, max_y))
 }
 
+fn get_mouse_resolution_rect(displays: &[Display]) -> Option<(i32, i32, i32, i32)> {
+    let compositor_rect = scrap::wayland::display::get_desktop_rect_for_uinput();
+    let capturable_rect = get_desktop_rect_from_displays(displays);
+    if is_hyprland_session() && compositor_rect.is_some() {
+        // Hyprland portal streams are per-monitor capture frames and may all
+        // report origin (0, 0). Uinput needs compositor desktop coordinates.
+        return compositor_rect;
+    }
+    compositor_rect.or(capturable_rect)
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub(super) async fn ensure_inited() -> ResultType<()> {
     check_init().await
@@ -262,22 +263,9 @@ pub(super) async fn check_init() -> ResultType<()> {
                         bail!("Wayland capturable displays disappeared during initialization");
                     }
                     if crate::input_service::wayland_use_uinput() {
-                        if let Some((minx, maxx, miny, maxy)) =
-                            scrap::wayland::display::get_desktop_rect_for_uinput()
-                        {
+                        if let Some((minx, maxx, miny, maxy)) = get_mouse_resolution_rect(&all) {
                             log::info!(
-                                "update mouse resolution from compositor displays: ({}, {}), ({}, {})",
-                                minx,
-                                maxx,
-                                miny,
-                                maxy
-                            );
-                            pending_mouse_resolution = Some((minx, maxx, miny, maxy));
-                        } else if let Some((minx, maxx, miny, maxy)) =
-                            get_desktop_rect_from_displays(&all)
-                        {
-                            log::info!(
-                                "update mouse resolution from capturables: ({}, {}), ({}, {})",
+                                "update mouse resolution from Wayland displays: ({}, {}), ({}, {})",
                                 minx,
                                 maxx,
                                 miny,
@@ -303,28 +291,24 @@ pub(super) async fn check_init() -> ResultType<()> {
 
                     log::debug!(
                         "#displays={}, primary={}, rects: {:?}, cpus={}/{}",
-                            num,
-                            primary,
-                            rects,
-                            num_cpus::get_physical(),
-                            num_cpus::get()
-                        );
+                        num,
+                        primary,
+                        rects,
+                        num_cpus::get_physical(),
+                        num_cpus::get()
+                    );
 
-                    // Create individual CapDisplayInfo for each display with its own capturer
+                    // Cache display metadata only. The PipeWire capturer is opened
+                    // on demand for the selected monitor to avoid multiple active
+                    // GStreamer pipelines during Wayland display switching.
                     for (idx, display) in all.into_iter().enumerate() {
-                        let capturer =
-                            Box::into_raw(Box::new(Capturer::new(display).with_context(|| {
-                                format!("Failed to create capturer for display {}", idx)
-                            })?));
-                        let capturer = CapturerPtr(capturer);
-
                         let cap_display_info = Box::into_raw(Box::new(CapDisplayInfo {
                             rects: rects.clone(),
                             displays: displays.clone(),
                             num,
                             primary,
                             current: idx,
-                            capturer,
+                            display,
                         }));
 
                         lock.insert(idx, cap_display_info as u64);
@@ -379,7 +363,6 @@ pub fn clear() {
     for (_, addr) in write_lock.iter() {
         let cap_display_info: *mut CapDisplayInfo = *addr as _;
         unsafe {
-            let _box_capturer = Box::from_raw((*cap_display_info).capturer.0);
             let _box_cap_display_info = Box::from_raw(cap_display_info);
         }
     }
@@ -401,6 +384,9 @@ pub(super) fn get_capturer_for_display(
         unsafe {
             let cap_display_info = &*cap_display_info;
             let rect = cap_display_info.rects[cap_display_info.current];
+            let capturer = Capturer::new(cap_display_info.display.clone()).with_context(|| {
+                format!("Failed to create capturer for display {}", display_idx)
+            })?;
             Ok(super::video_service::CapturerInfo {
                 origin: rect.0,
                 width: rect.1,
@@ -409,7 +395,7 @@ pub(super) fn get_capturer_for_display(
                 current: cap_display_info.current,
                 privacy_mode_id: 0,
                 _capturer_privacy_mode_id: 0,
-                capturer: Box::new(cap_display_info.capturer.clone()),
+                capturer: Box::new(capturer),
             })
         }
     } else {

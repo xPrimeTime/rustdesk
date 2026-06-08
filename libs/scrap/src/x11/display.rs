@@ -4,7 +4,7 @@ use super::ffi::*;
 use super::Server;
 use crate::Pixfmt;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Display {
     server: Rc<Server>,
     default: bool,

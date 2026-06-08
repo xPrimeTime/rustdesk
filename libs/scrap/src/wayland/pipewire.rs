@@ -34,6 +34,7 @@ use super::screencast_portal::OrgFreedesktopPortalScreenCast as screencast_porta
 
 lazy_static! {
     pub static ref RDP_SESSION_INFO: Mutex<Option<RdpSessionInfo>> = Mutex::new(None);
+    static ref EXTRA_RDP_SESSION_INFO: Mutex<Vec<RdpSessionInfo>> = Mutex::new(Vec::new());
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +56,7 @@ struct PipewireDisplayOffsetCache {
 // KDE Plasma may not provide position info
 static HAS_POSITION_ATTR: AtomicBool = AtomicBool::new(false);
 static IS_SERVER_RUNNING: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1:true, 2: false
+static TRIED_ADDITIONAL_GRANTS: AtomicBool = AtomicBool::new(false);
 
 impl PipewireDisplayOffsetCache {
     fn displays_to_key(displays: &Arc<Displays>) -> String {
@@ -70,8 +72,10 @@ impl PipewireDisplayOffsetCache {
 #[inline]
 pub fn close_session() {
     let _ = RDP_SESSION_INFO.lock().unwrap().take();
+    EXTRA_RDP_SESSION_INFO.lock().unwrap().clear();
     clear_wayland_displays_cache();
     HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
+    TRIED_ADDITIONAL_GRANTS.store(false, Ordering::SeqCst);
 }
 
 #[inline]
@@ -90,9 +94,16 @@ pub fn try_close_session() {
     }
     if close {
         *rdp_info = None;
+        EXTRA_RDP_SESSION_INFO.lock().unwrap().clear();
         clear_wayland_displays_cache();
         HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
+        TRIED_ADDITIONAL_GRANTS.store(false, Ordering::SeqCst);
     }
+}
+
+#[inline]
+pub fn set_server_running(is_running: bool) {
+    IS_SERVER_RUNNING.store(if is_running { 1 } else { 2 }, Ordering::SeqCst);
 }
 
 pub struct RdpSessionInfo {
@@ -152,6 +163,7 @@ pub struct PipeWireCapturable {
     fd: OwnedFd,
     path: u64,
     source_type: u64,
+    crop: Option<(usize, usize, usize, usize)>,
     pub primary: bool,
     pub position: (i32, i32),
     pub logical_size: (usize, usize),
@@ -165,25 +177,35 @@ impl PipeWireCapturable {
         resolution: Arc<Mutex<Option<(usize, usize)>>>,
         stream: &PwStreamInfo,
     ) -> Self {
-        // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
-        // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let physical_size = get_res(Self {
-            dbus_conn: conn.clone(),
-            fd: fd.clone(),
-            path: stream.path,
-            source_type: stream.source_type,
-            primary: false,
-            position: stream.position,
-            logical_size: stream.size,
-            physical_size: (0, 0),
-        })
-        .unwrap_or(stream.size);
+        // Hyprland returns the selected monitor size in the portal stream metadata.
+        // Avoid probing it with a temporary GStreamer pipeline, because multiple
+        // PipeWire streams can become unstable when we start probe recorders
+        // during every server-side display refresh/switch.
+        let physical_size = if is_server_running() && is_hyprland_session() {
+            stream.size
+        } else {
+            // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
+            // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
+            get_res(Self {
+                dbus_conn: conn.clone(),
+                fd: fd.clone(),
+                path: stream.path,
+                source_type: stream.source_type,
+                crop: None,
+                primary: false,
+                position: stream.position,
+                logical_size: stream.size,
+                physical_size: (0, 0),
+            })
+            .unwrap_or(stream.size)
+        };
         *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,
             fd,
             path: stream.path,
             source_type: stream.source_type,
+            crop: None,
             primary: false,
             position: stream.position,
             logical_size: stream.size,
@@ -228,6 +250,207 @@ impl Capturable for PipeWireCapturable {
     }
 }
 
+fn desktop_bounds(
+    displays: &[hbb_common::platform::linux::WaylandDisplayInfo],
+    logical: bool,
+) -> Option<(i32, i32, usize, usize)> {
+    if displays.is_empty() {
+        return None;
+    }
+
+    let min_x = displays.iter().map(|d| d.x).min()?;
+    let min_y = displays.iter().map(|d| d.y).min()?;
+    let display_size = |d: &hbb_common::platform::linux::WaylandDisplayInfo| {
+        if logical {
+            d.logical_size.unwrap_or((d.width, d.height))
+        } else {
+            (d.width, d.height)
+        }
+    };
+    let max_x = displays
+        .iter()
+        .map(|d| {
+            let (w, _) = display_size(d);
+            d.x + w
+        })
+        .max()?;
+    let max_y = displays
+        .iter()
+        .map(|d| {
+            let (_, h) = display_size(d);
+            d.y + h
+        })
+        .max()?;
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some((
+        min_x,
+        min_y,
+        (max_x - min_x) as usize,
+        (max_y - min_y) as usize,
+    ))
+}
+
+fn split_workspace_capturable(
+    capturable: PipeWireCapturable,
+) -> Result<Vec<PipeWireCapturable>, PipeWireCapturable> {
+    let displays = get_displays();
+    if displays.displays.len() <= 1 || capturable.crop.is_some() {
+        return Err(capturable);
+    }
+
+    let Some((min_x, min_y, desktop_w, desktop_h, logical_basis)) =
+        desktop_bounds(&displays.displays, false)
+            .map(|(x, y, w, h)| (x, y, w, h, false))
+            .filter(|(_, _, w, h, _)| capturable.physical_size == (*w, *h))
+            .or_else(|| {
+                desktop_bounds(&displays.displays, true)
+                    .map(|(x, y, w, h)| (x, y, w, h, true))
+                    .filter(|(_, _, w, h, _)| capturable.physical_size == (*w, *h))
+            })
+    else {
+        return Err(capturable);
+    };
+
+    let mut capturables = Vec::with_capacity(displays.displays.len());
+    for wd in displays.displays.iter() {
+        let x = wd.x - min_x;
+        let y = wd.y - min_y;
+        if x < 0 || y < 0 {
+            return Err(capturable);
+        }
+        let (crop_w, crop_h) = if logical_basis {
+            wd.logical_size.unwrap_or((wd.width, wd.height))
+        } else {
+            (wd.width, wd.height)
+        };
+        if crop_w <= 0 || crop_h <= 0 {
+            return Err(capturable);
+        }
+        let crop = (x as usize, y as usize, crop_w as usize, crop_h as usize);
+        if crop.0 + crop.2 > desktop_w || crop.1 + crop.3 > desktop_h {
+            return Err(capturable);
+        }
+
+        let logical_size = wd
+            .logical_size
+            .map(|(w, h)| (w as usize, h as usize))
+            .unwrap_or((wd.width as usize, wd.height as usize));
+        let mut display_capturable = capturable.clone();
+        display_capturable.crop = Some(crop);
+        display_capturable.position = (wd.x, wd.y);
+        display_capturable.logical_size = logical_size;
+        display_capturable.physical_size = (crop.2, crop.3);
+        capturables.push(display_capturable);
+    }
+
+    debug!(
+        "Split single Wayland workspace stream {}x{} into {} monitor capturables.",
+        desktop_w,
+        desktop_h,
+        capturables.len()
+    );
+    Ok(capturables)
+}
+
+fn capturables_from_session(rdp_info: &RdpSessionInfo) -> Vec<PipeWireCapturable> {
+    rdp_info
+        .streams
+        .iter()
+        .map(|s| {
+            PipeWireCapturable::new(
+                rdp_info.conn.clone(),
+                rdp_info.fd.clone(),
+                rdp_info.resolution.clone(),
+                s,
+            )
+        })
+        .collect()
+}
+
+fn log_capturables(label: &str, capturables: &[PipeWireCapturable]) {
+    debug!(
+        "{}: {} Wayland capturable stream(s): {:?}",
+        label,
+        capturables.len(),
+        capturables
+            .iter()
+            .map(|c| (
+                c.path.to_string(),
+                c.position,
+                c.logical_size,
+                c.physical_size,
+                c.crop
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn append_held_extra_grants(capturables: &mut Vec<PipeWireCapturable>) {
+    let extra_sessions = EXTRA_RDP_SESSION_INFO.lock().unwrap();
+    if extra_sessions.is_empty() {
+        return;
+    }
+
+    for rdp_info in extra_sessions.iter() {
+        capturables.extend(capturables_from_session(rdp_info));
+    }
+}
+
+fn extend_with_additional_grants(capturables: &mut Vec<PipeWireCapturable>) {
+    if !is_hyprland_session()
+        || !is_server_running()
+        || TRIED_ADDITIONAL_GRANTS.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    let compositor_display_count = get_displays().displays.len();
+    if compositor_display_count <= capturables.len() {
+        return;
+    }
+
+    warn!(
+        "Wayland portal granted {} stream(s) for {} compositor display(s); requesting additional one-display grants.",
+        capturables.len(),
+        compositor_display_count
+    );
+
+    let mut extra_sessions = EXTRA_RDP_SESSION_INFO.lock().unwrap();
+    while capturables.len() < compositor_display_count {
+        let (conn, fd, streams, session, is_support_restore_token) =
+            match request_remote_desktop(false) {
+                Ok(session) => session,
+                Err(err) => {
+                    warn!(
+                        "Stopped requesting additional Wayland display grants: {}",
+                        err
+                    );
+                    break;
+                }
+            };
+        if streams.is_empty() {
+            warn!("Additional Wayland display grant returned no streams.");
+            break;
+        }
+
+        let rdp_info = RdpSessionInfo {
+            conn: Arc::new(conn),
+            streams,
+            fd,
+            session,
+            is_support_restore_token,
+            resolution: Arc::new(Mutex::new(None)),
+        };
+        let extra_capturables = capturables_from_session(&rdp_info);
+        log_capturables("Additional Wayland portal grant", &extra_capturables);
+        capturables.extend(extra_capturables);
+        extra_sessions.push(rdp_info);
+    }
+}
+
 fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Error>> {
     let rec = PipeWireRecorder::new(capturable)?;
     if let Some(sample) = rec
@@ -254,6 +477,7 @@ fn get_res(capturable: PipeWireCapturable) -> Result<(usize, usize), Box<dyn Err
 pub struct PipeWireRecorder {
     buffer: Option<gst::MappedBuffer<gst::buffer::Readable>>,
     buffer_cropped: Vec<u8>,
+    crop: Option<(usize, usize, usize, usize)>,
     pix_fmt: String,
     is_cropped: bool,
     pipeline: gst::Pipeline,
@@ -335,6 +559,7 @@ impl PipeWireRecorder {
             pipeline,
             appsink,
             buffer: None,
+            crop: capturable.crop,
             pix_fmt: "".into(),
             width: 0,
             height: 0,
@@ -375,6 +600,10 @@ impl Recorder for PipeWireRecorder {
             if Some((0, 0, w as u32, h as u32)) == crop {
                 crop = None;
             }
+            let crop = self
+                .crop
+                .map(|(x, y, w, h)| (x as u32, y as u32, w as u32, h as u32))
+                .or(crop);
             let buf = buf
                 .into_mapped_buffer_readable()
                 .map_err(|_| GStreamerError("Failed to map buffer.".into()))?;
@@ -402,6 +631,14 @@ impl Recorder for PipeWireRecorder {
                     let y_off = y_off as usize;
                     let w_crop = w_crop as usize;
                     let h_crop = h_crop as usize;
+                    if x_off + w_crop > w || y_off + h_crop > h {
+                        return Err(Box::new(GStreamerError(format!(
+                            "Crop {:?} exceeds PipeWire frame size {}x{}",
+                            (x_off, y_off, w_crop, h_crop),
+                            w,
+                            h
+                        ))));
+                    }
                     self.buffer_cropped.clear();
                     let data = buf.as_slice();
                     // BGRx is 4 bytes per pixel
@@ -610,7 +847,7 @@ const RESTORE_TOKEN: &str = "restore_token";
 const RESTORE_TOKEN_CONF_KEY: &str = "wayland-restore-token";
 const PIPEWIRE_DISPLAY_OFFSET_CONF_KEY: &str = "wayland-pipewire-display-offset";
 
-fn is_hyprland_session() -> bool {
+pub fn is_hyprland_session() -> bool {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
         return true;
     }
@@ -1019,18 +1256,29 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
         }
     };
 
-    Ok(rdp_info
-        .streams
-        .iter()
-        .map(|s| {
-            PipeWireCapturable::new(
-                rdp_info.conn.clone(),
-                rdp_info.fd.clone(),
-                rdp_info.resolution.clone(),
-                s,
-            )
-        })
-        .collect())
+    let mut capturables = capturables_from_session(rdp_info);
+    append_held_extra_grants(&mut capturables);
+    log_capturables("Primary Wayland portal grant", &capturables);
+
+    if is_hyprland_session() {
+        extend_with_additional_grants(&mut capturables);
+        log_capturables("Final Hyprland Wayland capturables", &capturables);
+        return Ok(capturables);
+    }
+
+    if capturables.len() == 1 {
+        if let Some(capturable) = capturables.pop() {
+            capturables = match split_workspace_capturable(capturable) {
+                Ok(split) => split,
+                Err(capturable) => vec![capturable],
+            };
+        }
+    }
+
+    extend_with_additional_grants(&mut capturables);
+    log_capturables("Final Wayland capturables", &capturables);
+
+    Ok(capturables)
 }
 
 // If `is_server_running()` is true, then `screencast_portal::start` is called.
@@ -1140,6 +1388,13 @@ pub fn fill_displays(
     };
 
     let all_displays = get_displays();
+    if all_displays.displays.len() > 1 && shared_displays.len() <= 1 {
+        warn!(
+            "Wayland portal exposed {} capturable stream(s) for {} compositor display(s); remote monitor switching will be limited until the portal grants multiple displays.",
+            shared_displays.len(),
+            all_displays.displays.len()
+        );
+    }
     if !HAS_POSITION_ATTR.load(Ordering::SeqCst) {
         if all_displays.displays.len() > 1 {
             debug!("Multiple Wayland displays detected, adjusting stream positions accordingly.");
@@ -1154,7 +1409,7 @@ pub fn fill_displays(
         HAS_POSITION_ATTR.store(true, Ordering::SeqCst);
     }
 
-    if all_displays.displays.len() > 1 {
+    if all_displays.displays.len() > 1 && rdp_info.streams.len() == shared_displays.len() {
         sort_streams(&all_displays, shared_displays, &mut rdp_info.streams);
     }
 
@@ -1468,6 +1723,7 @@ fn fill_multi_matched_positions_cursor(
                     fd: fd.clone(),
                     path: pw_stream_with_cursor.path,
                     source_type: pw_stream_with_cursor.source_type,
+                    crop: None,
                     primary: false,
                     position: pw_stream_with_cursor.position,
                     logical_size: pw_stream_with_cursor.size,

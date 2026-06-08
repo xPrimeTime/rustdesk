@@ -315,7 +315,7 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
     let displays = all
         .iter()
         .map(|d| {
-            let display_name = d.name();
+            let mut display_name = d.name();
             #[allow(unused_assignments)]
             #[allow(unused_mut)]
             let mut scale = 1.0;
@@ -347,6 +347,9 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
                     }
                     if matched.len() == 1 {
                         let wd = matched[0];
+                        if display_name.is_empty() {
+                            display_name = wd.name.clone();
+                        }
                         x = wd.x;
                         y = wd.y;
                         if let Some((logical_w, _logical_h)) = wd.logical_size {
@@ -377,6 +380,27 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
         })
         .collect::<Vec<DisplayInfo>>();
     SYNC_DISPLAYS.lock().unwrap().check_changed(displays);
+}
+
+#[cfg(target_os = "linux")]
+pub fn preferred_wayland_display_idx(displays: &[DisplayInfo]) -> Option<usize> {
+    if is_x11() {
+        return None;
+    }
+
+    let preferred = std::env::var("RUSTDESK_PREFERRED_WAYLAND_DISPLAY").ok()?;
+    let preferred = preferred.trim();
+    if preferred.is_empty() {
+        return None;
+    }
+
+    let preferred_lower = preferred.to_ascii_lowercase();
+    displays.iter().position(|display| {
+        let name = display.name.trim();
+        !name.is_empty()
+            && (name.eq_ignore_ascii_case(preferred)
+                || name.to_ascii_lowercase().starts_with(&preferred_lower))
+    })
 }
 
 pub fn is_inited_msg() -> Option<Message> {

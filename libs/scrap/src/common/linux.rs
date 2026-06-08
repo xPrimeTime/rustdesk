@@ -45,6 +45,7 @@ impl TraitCapturer for Capturer {
     }
 }
 
+#[derive(Clone)]
 pub enum Display {
     X11(x11::Display),
     WAYLAND(wayland::Display),

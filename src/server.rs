@@ -588,6 +588,10 @@ pub async fn start_server(is_server: bool, no_server: bool) {
 
     if is_server {
         crate::common::set_server_running(true);
+        #[cfg(target_os = "linux")]
+        if !crate::platform::is_x11() {
+            scrap::wayland::pipewire::set_server_running(true);
+        }
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);
@@ -601,7 +605,29 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         input_service::fix_key_down_timeout_loop();
         #[cfg(target_os = "linux")]
         if input_service::wayland_use_uinput() {
-            allow_err!(input_service::setup_uinput(0, 1920, 0, 1080).await);
+            crate::platform::ensure_uinput_service();
+            let mut last_err = None;
+            for attempt in 1..=30 {
+                match input_service::setup_uinput(0, 1920, 0, 1080).await {
+                    Ok(()) => {
+                        if attempt > 1 {
+                            log::info!("Wayland uinput setup succeeded after {attempt} attempts");
+                        }
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            if let Some(err) = last_err {
+                log::error!(
+                    "Failed to setup Wayland uinput input backend: {}; remote input will not work on Wayland",
+                    err
+                );
+            }
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         wait_initial_config_sync().await;
@@ -777,8 +803,7 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                 loop {
                     sleep(CONFIG_SYNC_INTERVAL_SECS).await;
                     let cfg = (Config::get(), Config2::get());
-                    let should_sync =
-                        cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
+                    let should_sync = cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
                     if should_sync {
                         if is_root_config_empty {
                             log::info!("root config is empty, sync our config to root");

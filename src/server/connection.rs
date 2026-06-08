@@ -1674,6 +1674,21 @@ impl Connection {
                     {
                         self.retina.set_displays(&displays);
                     }
+                    #[cfg(target_os = "linux")]
+                    if crate::platform::current_is_wayland() {
+                        if let Some(preferred_idx) =
+                            super::display_service::preferred_wayland_display_idx(&displays)
+                        {
+                            if preferred_idx < displays.len() && self.display_idx != preferred_idx {
+                                log::info!(
+                                    "Selecting preferred Wayland display {} ({}) for new session",
+                                    preferred_idx,
+                                    displays[preferred_idx].name
+                                );
+                                self.display_idx = preferred_idx;
+                            }
+                        }
+                    }
                     pi.displays = displays;
                     pi.current_display = self.display_idx as _;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -3523,7 +3538,7 @@ impl Connection {
         let display_idx = s.display as usize;
         if self.display_idx != display_idx {
             if let Some(server) = self.server.upgrade() {
-                self.switch_display_to(display_idx, server.clone());
+                self.switch_display_to(display_idx, server.clone()).await;
 
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if s.width != 0 && s.height != 0 {
@@ -3558,22 +3573,51 @@ impl Connection {
         }
     }
 
-    fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) {
+    async fn wait_wayland_capturers_drained() {
+        #[cfg(target_os = "linux")]
+        if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
+            let started = Instant::now();
+            while super::wayland::active_display_count() > 0
+                && started.elapsed() < Duration::from_millis(4_000)
+            {
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    async fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) {
         let new_service_name = video_service::get_service_name(self.video_source(), display_idx);
         let old_service_name =
             video_service::get_service_name(self.video_source(), self.display_idx);
-        let mut lock = server.write().unwrap();
-        if display_idx != *display_service::PRIMARY_DISPLAY_IDX {
-            if !lock.contains(&new_service_name) {
-                lock.add_service(Box::new(video_service::new(
-                    self.video_source(),
-                    display_idx,
-                )));
+
+        #[cfg(target_os = "linux")]
+        if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
+            {
+                let mut lock = server.write().unwrap();
+                lock.subscribe(&old_service_name, self.inner.clone(), false);
             }
+            Self::wait_wayland_capturers_drained().await;
         }
+
+        let mut lock = server.write().unwrap();
+        if display_idx != *display_service::PRIMARY_DISPLAY_IDX && !lock.contains(&new_service_name)
+        {
+            lock.add_service(Box::new(video_service::new(
+                self.video_source(),
+                display_idx,
+            )));
+        }
+
         // For versions greater than 1.2.4, a `CaptureDisplays` message will be sent immediately.
         // Unnecessary capturers will be removed then.
-        if !crate::common::is_support_multi_ui_session(&self.lr.version) {
+        #[cfg(target_os = "linux")]
+        let force_single_wayland_capture =
+            !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session();
+        #[cfg(not(target_os = "linux"))]
+        let force_single_wayland_capture = false;
+        if force_single_wayland_capture
+            || !crate::common::is_support_multi_ui_session(&self.lr.version)
+        {
             lock.subscribe(&old_service_name, self.inner.clone(), false);
         }
         lock.subscribe(&new_service_name, self.inner.clone(), true);
@@ -3605,6 +3649,58 @@ impl Connection {
     async fn capture_displays(&mut self, add: &[usize], sub: &[usize], set: &[usize]) {
         let video_source = self.video_source();
         if let Some(sever) = self.server.upgrade() {
+            #[cfg(target_os = "linux")]
+            if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
+                let target = set.first().or_else(|| add.first()).copied();
+                if let Some(display) = target {
+                    let service_name = video_service::get_service_name(video_source, display);
+                    {
+                        let mut lock = sever.write().unwrap();
+                        if !lock.contains(&service_name) {
+                            lock.add_service(Box::new(video_service::new(video_source, display)));
+                        }
+                        lock.capture_displays(
+                            self.inner.clone(),
+                            video_source,
+                            &[display],
+                            false,
+                            true,
+                        );
+                    }
+                    Self::wait_wayland_capturers_drained().await;
+                    {
+                        let mut lock = sever.write().unwrap();
+                        lock.capture_displays(
+                            self.inner.clone(),
+                            video_source,
+                            &[display],
+                            true,
+                            false,
+                        );
+                    }
+                    self.display_idx = display;
+                    self.multi_ui_session = false;
+                    if self.follow_remote_window {
+                        sever.write().unwrap().subscribe(
+                            NAME_WINDOW_FOCUS,
+                            self.inner.clone(),
+                            true,
+                        );
+                    }
+                    return;
+                } else if !sub.is_empty() {
+                    sever.write().unwrap().capture_displays(
+                        self.inner.clone(),
+                        video_source,
+                        sub,
+                        false,
+                        true,
+                    );
+                    self.multi_ui_session = false;
+                    return;
+                }
+            }
+
             let mut lock = sever.write().unwrap();
             for display in add.iter() {
                 let service_name = video_service::get_service_name(video_source, *display);
@@ -5269,22 +5365,29 @@ impl Retina {
             && e.x < origin.0 + logical_w
             && e.y < origin.1 + logical_h;
 
-        // On Wayland/Hyprland a single selected monitor is often encoded with
-        // monitor-local coordinates while uinput still expects global desktop
-        // coordinates. Promote local coordinates into the display's global
-        // space before applying scale conversion.
+        // Hyprland's portal grants one selected monitor per stream. The client
+        // sends mouse coordinates in captured-frame pixels, while uinput expects
+        // compositor desktop coordinates. Convert local physical pixels into
+        // global logical desktop space for the active monitor.
         #[cfg(target_os = "linux")]
-        if origin != (0, 0) {
-            if !in_global_physical_bounds && e.x >= 0 && e.y >= 0 && e.x < d.width && e.y < d.height {
-                // Selected-monitor remote sessions deliver coordinates in the
-                // captured stream's pixel space. Promote them into global
-                // desktop space by applying only the monitor origin here.
-                // Applying `scale` again would incorrectly shrink HiDPI
-                // monitors into a smaller center region.
-                e.x += origin.0;
-                e.y += origin.1;
+        if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
+            let in_local_physical = e.x >= 0 && e.y >= 0 && e.x < d.width && e.y < d.height;
+            let should_treat_as_local = in_local_physical
+                && (!in_global_physical_bounds
+                    || !in_global_logical_bounds
+                    || (origin == (0, 0) && (s - 1.0).abs() > f64::EPSILON));
+            if should_treat_as_local {
+                let scale = if s > 0.0 { s } else { 1.0 };
+                e.x = origin.0 + ((e.x as f64) / scale).round() as i32;
+                e.y = origin.1 + ((e.y as f64) / scale).round() as i32;
                 return;
             }
+        }
+
+        // Other Linux compositors can still report selected-monitor local
+        // coordinates. Keep the old origin-promotion behavior for them.
+        #[cfg(target_os = "linux")]
+        if origin != (0, 0) {
             if !in_global_logical_bounds
                 && e.x >= 0
                 && e.y >= 0
