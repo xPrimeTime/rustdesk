@@ -615,16 +615,28 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
     // TODO: Make sure there's no race
     set_uinput_resolution(minx, maxx, miny, maxy).await?;
 
-    let keyboard = super::uinput::client::UInputKeyboard::new().await?;
-    log::info!("UInput keyboard created");
     let mouse = super::uinput::client::UInputMouse::new().await?;
     log::info!("UInput mouse created");
 
-    ENIGO
-        .lock()
-        .unwrap()
-        .set_custom_keyboard(Box::new(keyboard));
-    ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
+    let keyboard = match super::uinput::client::UInputKeyboard::new().await {
+        Ok(keyboard) => {
+            log::info!("UInput keyboard created");
+            Some(keyboard)
+        }
+        Err(err) => {
+            log::warn!(
+                "Wayland uinput keyboard backend unavailable; keyboard input will be disabled: {}",
+                err
+            );
+            None
+        }
+    };
+
+    let mut enigo = ENIGO.lock().unwrap();
+    if let Some(keyboard) = keyboard {
+        enigo.set_custom_keyboard(Box::new(keyboard));
+    }
+    enigo.set_custom_mouse(Box::new(mouse));
     Ok(())
 }
 

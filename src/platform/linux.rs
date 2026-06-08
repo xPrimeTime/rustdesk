@@ -20,7 +20,7 @@ use std::{
     process::{Child, Command},
     string::String,
     sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    sync::{Arc, Once},
     time::{Duration, Instant},
 };
 use terminfo::{capability as cap, Database};
@@ -431,6 +431,8 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     }
 }
 
+static START_UINPUT_SERVICE: Once = Once::new();
+
 fn start_uinput_service() {
     use crate::server::uinput::service;
     std::thread::spawn(|| {
@@ -442,6 +444,10 @@ fn start_uinput_service() {
     std::thread::spawn(|| {
         service::start_service_mouse();
     });
+}
+
+pub fn ensure_uinput_service() {
+    START_UINPUT_SERVICE.call_once(start_uinput_service);
 }
 
 /// Suggests the best terminal type based on the environment.
@@ -803,7 +809,7 @@ pub fn start_os_service() {
     check_if_stop_service();
     stop_rustdesk_servers();
     stop_subprocess();
-    start_uinput_service();
+    ensure_uinput_service();
 
     std::thread::spawn(|| {
         allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));

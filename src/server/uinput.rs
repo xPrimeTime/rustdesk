@@ -5,7 +5,9 @@ use evdev::{
     AttributeSet, EventType, InputEvent,
 };
 use hbb_common::{
-    allow_err, bail, log,
+    allow_err,
+    anyhow::anyhow,
+    bail, log,
     tokio::{self, runtime::Runtime},
     ResultType,
 };
@@ -26,9 +28,31 @@ pub mod client {
 
     impl UInputKeyboard {
         pub async fn new() -> ResultType<Self> {
-            let conn = ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_KEYBOARD).await?;
-            let rt = Runtime::new()?;
-            Ok(Self { conn, rt })
+            let mut conn = ipc::connect(IPC_CONN_TIMEOUT, IPC_POSTFIX_KEYBOARD).await?;
+            conn.send(&Data::Keyboard(DataKeyboard::GetKeyState(Key::CapsLock)))
+                .await?;
+            match conn.next_timeout(IPC_REQUEST_TIMEOUT).await {
+                Ok(Some(Data::KeyboardResponse(ipc::DataKeyboardResponse::GetKeyState(_)))) => {
+                    let rt = Runtime::new()?;
+                    Ok(Self { conn, rt })
+                }
+                Ok(Some(resp)) => {
+                    bail!(
+                        "FATAL error, wait keyboard probe other response: {:?}",
+                        &resp
+                    );
+                }
+                Ok(None) => {
+                    bail!("FATAL error, wait keyboard probe, receive None");
+                }
+                Err(err) => {
+                    bail!(
+                        "FATAL error, wait keyboard probe timeout {}, {}",
+                        &err,
+                        IPC_REQUEST_TIMEOUT
+                    );
+                }
+            }
         }
 
         fn send(&mut self, data: Data) -> ResultType<()> {
@@ -386,7 +410,7 @@ pub mod service {
     /// Non-ASCII chars: skipped — this runs in the --service (root) process where clipboard
     /// operations are unreliable (typically no user session environment).
     /// Non-ASCII input is normally handled by the --server process via input_text_via_clipboard_server.
-    fn input_text_wayland(text: &str, keyboard: &mut VirtualDevice) {
+    fn input_text_wayland(text: &str, keyboard: &mut KeyboardDevice) {
         let portal_info = {
             let session_info = RDP_SESSION_INFO.lock().unwrap();
             session_info
@@ -447,7 +471,7 @@ pub mod service {
     /// Send a single key down or up event for a Layout character.
     /// Used by KeyDown/KeyUp to maintain correct press/release semantics.
     /// `down`: true for key press, false for key release.
-    fn input_char_wayland_key_event(chr: char, down: bool, keyboard: &mut VirtualDevice) {
+    fn input_char_wayland_key_event(chr: char, down: bool, keyboard: &mut KeyboardDevice) {
         let keysym = char_to_keysym(chr);
         let portal_state: u32 = if down { 1 } else { 0 };
 
@@ -530,28 +554,116 @@ pub mod service {
         }
     }
 
-    fn create_uinput_keyboard() -> ResultType<VirtualDevice> {
-        // TODO: ensure keys here
-        let mut keys = AttributeSet::<evdev::Key>::new();
-        for i in evdev::Key::KEY_ESC.code()..(evdev::Key::BTN_TRIGGER_HAPPY40.code() + 1) {
-            let key = evdev::Key::new(i);
-            if !format!("{:?}", &key).contains("unknown key") {
-                keys.insert(key);
+    enum KeyboardDevice {
+        Evdev(VirtualDevice),
+        WriteOnly(mouce::UInputKeyboardManager),
+    }
+
+    impl KeyboardDevice {
+        fn emit(&mut self, events: &[InputEvent]) -> std::io::Result<()> {
+            match self {
+                Self::Evdev(keyboard) => keyboard.emit(events),
+                Self::WriteOnly(keyboard) => keyboard.emit_events(events),
             }
         }
+
+        fn is_key_pressed(&self, keys: &[evdev::Key]) -> bool {
+            match self {
+                Self::Evdev(keyboard) => keyboard
+                    .get_key_state()
+                    .map(|pressed| keys.iter().any(|key| pressed.contains(*key)))
+                    .unwrap_or(false),
+                Self::WriteOnly(keyboard) => keys.iter().any(|key| keyboard.is_key_pressed(*key)),
+            }
+        }
+
+        fn is_led_on(&self, led: evdev::LedType) -> bool {
+            match self {
+                Self::Evdev(keyboard) => keyboard
+                    .get_led_state()
+                    .map(|leds| leds.contains(led))
+                    .unwrap_or(false),
+                Self::WriteOnly(keyboard) => keyboard.is_led_on(led),
+            }
+        }
+    }
+
+    fn build_evdev_uinput_keyboard(
+        keys: &AttributeSet<evdev::Key>,
+        leds: Option<&AttributeSet<evdev::LedType>>,
+        miscs: Option<&AttributeSet<evdev::MiscType>>,
+    ) -> ResultType<VirtualDevice> {
+        let builder = VirtualDeviceBuilder::new()
+            .map_err(|err| anyhow!("open /dev/uinput for keyboard: {}", err))?
+            .name("RustDesk UInput Keyboard")
+            .with_keys(keys)
+            .map_err(|err| anyhow!("enable keyboard key capabilities: {}", err))?;
+        let builder = if let Some(leds) = leds {
+            builder
+                .with_leds(leds)
+                .map_err(|err| anyhow!("enable keyboard LED capabilities: {}", err))?
+        } else {
+            builder
+        };
+        let builder = if let Some(miscs) = miscs {
+            builder
+                .with_miscs(miscs)
+                .map_err(|err| anyhow!("enable keyboard MISC capabilities: {}", err))?
+        } else {
+            builder
+        };
+        Ok(builder
+            .build()
+            .map_err(|err| anyhow!("build keyboard uinput device: {}", err))?)
+    }
+
+    fn create_uinput_keyboard() -> ResultType<KeyboardDevice> {
+        let mut keys = AttributeSet::<evdev::Key>::new();
+        for key in KEY_MAP.values() {
+            keys.insert(*key);
+        }
+        for (key, is_shift) in KEY_MAP_LAYOUT.values() {
+            keys.insert(*key);
+            if *is_shift {
+                keys.insert(evdev::Key::KEY_LEFTSHIFT);
+            }
+        }
+        // Raw key events and modifier repair may still need these common modifiers.
+        keys.insert(evdev::Key::KEY_LEFTCTRL);
+        keys.insert(evdev::Key::KEY_RIGHTCTRL);
+        keys.insert(evdev::Key::KEY_LEFTALT);
+        keys.insert(evdev::Key::KEY_RIGHTALT);
+        keys.insert(evdev::Key::KEY_LEFTMETA);
+        keys.insert(evdev::Key::KEY_RIGHTMETA);
+
         let mut leds = AttributeSet::<evdev::LedType>::new();
         leds.insert(evdev::LedType::LED_NUML);
         leds.insert(evdev::LedType::LED_CAPSL);
         leds.insert(evdev::LedType::LED_SCROLLL);
         let mut miscs = AttributeSet::<evdev::MiscType>::new();
         miscs.insert(evdev::MiscType::MSC_SCAN);
-        let keyboard = VirtualDeviceBuilder::new()?
-            .name("RustDesk UInput Keyboard")
-            .with_keys(&keys)?
-            .with_leds(&leds)?
-            .with_miscs(&miscs)?
-            .build()?;
-        Ok(keyboard)
+        match build_evdev_uinput_keyboard(&keys, Some(&leds), Some(&miscs)) {
+            Ok(keyboard) => Ok(KeyboardDevice::Evdev(keyboard)),
+            Err(err) => {
+                log::warn!(
+                    "Failed to create full uinput keyboard, retrying without LED/MISC capabilities: {}",
+                    err
+                );
+                match build_evdev_uinput_keyboard(&keys, None, None) {
+                    Ok(keyboard) => Ok(KeyboardDevice::Evdev(keyboard)),
+                    Err(err) => {
+                        log::warn!(
+                            "Failed to create readable uinput keyboard, retrying with write-only keyboard: {}",
+                            err
+                        );
+                        let key_codes = keys.iter().map(|key| key.code()).collect::<Vec<_>>();
+                        Ok(KeyboardDevice::WriteOnly(
+                            mouce::UInputKeyboardManager::new(&key_codes)?,
+                        ))
+                    }
+                }
+            }
+        }
     }
 
     pub fn map_key(key: &enigo::Key) -> ResultType<(evdev::Key, bool)> {
@@ -584,7 +696,7 @@ pub mod service {
 
     async fn handle_keyboard(
         stream: &mut Connection,
-        keyboard: &mut VirtualDevice,
+        keyboard: &mut KeyboardDevice,
         data: &DataKeyboard,
     ) {
         let data_desc = match data {
@@ -659,46 +771,22 @@ pub mod service {
             }
             DataKeyboard::GetKeyState(key) => {
                 let key_state = if enigo::Key::CapsLock == *key {
-                    match keyboard.get_led_state() {
-                        Ok(leds) => leds.contains(evdev::LedType::LED_CAPSL),
-                        Err(_e) => {
-                            // log::debug!("Failed to get led state {}", &_e);
-                            false
-                        }
-                    }
+                    keyboard.is_led_on(evdev::LedType::LED_CAPSL)
                 } else if enigo::Key::NumLock == *key {
-                    match keyboard.get_led_state() {
-                        Ok(leds) => leds.contains(evdev::LedType::LED_NUML),
-                        Err(_e) => {
-                            // log::debug!("Failed to get led state {}", &_e);
-                            false
-                        }
-                    }
+                    keyboard.is_led_on(evdev::LedType::LED_NUML)
                 } else {
-                    match keyboard.get_key_state() {
-                        Ok(keys) => match key {
-                            enigo::Key::Shift => {
-                                keys.contains(evdev::Key::KEY_LEFTSHIFT)
-                                    || keys.contains(evdev::Key::KEY_RIGHTSHIFT)
-                            }
-                            enigo::Key::Control => {
-                                keys.contains(evdev::Key::KEY_LEFTCTRL)
-                                    || keys.contains(evdev::Key::KEY_RIGHTCTRL)
-                            }
-                            enigo::Key::Alt => {
-                                keys.contains(evdev::Key::KEY_LEFTALT)
-                                    || keys.contains(evdev::Key::KEY_RIGHTALT)
-                            }
-                            enigo::Key::Meta => {
-                                keys.contains(evdev::Key::KEY_LEFTMETA)
-                                    || keys.contains(evdev::Key::KEY_RIGHTMETA)
-                            }
-                            _ => false,
-                        },
-                        Err(_e) => {
-                            // log::debug!("Failed to get key state: {}", &_e);
-                            false
-                        }
+                    match key {
+                        enigo::Key::Shift => keyboard.is_key_pressed(&[
+                            evdev::Key::KEY_LEFTSHIFT,
+                            evdev::Key::KEY_RIGHTSHIFT,
+                        ]),
+                        enigo::Key::Control => keyboard
+                            .is_key_pressed(&[evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_RIGHTCTRL]),
+                        enigo::Key::Alt => keyboard
+                            .is_key_pressed(&[evdev::Key::KEY_LEFTALT, evdev::Key::KEY_RIGHTALT]),
+                        enigo::Key::Meta => keyboard
+                            .is_key_pressed(&[evdev::Key::KEY_LEFTMETA, evdev::Key::KEY_RIGHTMETA]),
+                        _ => false,
                     }
                 };
                 ipc_send_data(
@@ -1009,6 +1097,7 @@ pub mod service {
 // https://github.com/emrebicer/mouce
 mod mouce {
     use std::{
+        collections::HashSet,
         fs::File,
         io::{Error, ErrorKind, Result},
         mem::size_of,
@@ -1128,6 +1217,155 @@ mod mouce {
 
     pub struct UInputMouseManager {
         uinput_file: File,
+    }
+
+    pub struct UInputKeyboardManager {
+        uinput_file: File,
+        pressed_keys: HashSet<u16>,
+    }
+
+    impl UInputKeyboardManager {
+        pub fn new(keys: &[u16]) -> Result<Self> {
+            let manager = UInputKeyboardManager {
+                uinput_file: File::options()
+                    .write(true)
+                    .custom_flags(O_NONBLOCK)
+                    .open("/dev/uinput")?,
+                pressed_keys: HashSet::new(),
+            };
+            let fd = manager.uinput_file.as_raw_fd();
+            unsafe {
+                let ret = ioctl(fd, UI_SET_EVBIT, EV_KEY);
+                if ret < 0 {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "failed to enable keyboard EV_KEY: {}",
+                            Error::last_os_error()
+                        ),
+                    ));
+                }
+                for key in keys {
+                    let ret = ioctl(fd, UI_SET_KEYBIT, *key as c_int);
+                    if ret < 0 {
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            format!(
+                                "failed to enable keyboard key {}: {}",
+                                key,
+                                Error::last_os_error()
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            let mut usetup = UInputSetup {
+                id: InputId {
+                    bustype: BUS_USB,
+                    vendor: 0x2222,
+                    product: 0x4444,
+                    version: 0,
+                },
+                name: [0; UINPUT_MAX_NAME_SIZE],
+                ff_effects_max: 0,
+            };
+
+            let mut device_bytes: Vec<c_char> = "rustdesk-uinput-keyboard"
+                .chars()
+                .map(|ch| ch as c_char)
+                .collect();
+
+            for _ in 0..UINPUT_MAX_NAME_SIZE - device_bytes.len() {
+                device_bytes.push('\0' as c_char);
+            }
+
+            usetup.name.copy_from_slice(&device_bytes);
+
+            unsafe {
+                let ret = ioctl(fd, UI_DEV_SETUP, &usetup);
+                if ret < 0 {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "failed to setup keyboard device: {}",
+                            Error::last_os_error()
+                        ),
+                    ));
+                }
+                let ret = ioctl(fd, UI_DEV_CREATE);
+                if ret < 0 {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "failed to create keyboard device: {}",
+                            Error::last_os_error()
+                        ),
+                    ));
+                }
+            }
+
+            thread::sleep(Duration::from_millis(300));
+
+            Ok(manager)
+        }
+
+        fn emit(&self, r#type: c_int, code: c_int, value: c_int) -> Result<()> {
+            let mut event = InputEvent {
+                time: TimeVal {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                r#type: r#type as c_ushort,
+                code: code as c_ushort,
+                value,
+            };
+            let fd = self.uinput_file.as_raw_fd();
+
+            unsafe {
+                let count = size_of::<InputEvent>();
+                let written_bytes = write(fd, &mut event, count);
+                if written_bytes == -1 || written_bytes != count as c_long {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        "failed while trying to write keyboard event",
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+
+        pub fn emit_events(&mut self, events: &[evdev::InputEvent]) -> Result<()> {
+            for event in events {
+                let event_type = event.event_type().0;
+                let code = event.code();
+                let value = event.value();
+                self.emit(event_type as c_int, code as c_int, value)?;
+                if event_type == EV_KEY as u16 {
+                    match value {
+                        0 => {
+                            self.pressed_keys.remove(&code);
+                        }
+                        1 | 2 => {
+                            self.pressed_keys.insert(code);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.emit(EV_SYN, SYN_REPORT, 0)?;
+            thread::sleep(Duration::from_millis(1));
+            Ok(())
+        }
+
+        pub fn is_key_pressed(&self, key: evdev::Key) -> bool {
+            self.pressed_keys.contains(&key.code())
+        }
+
+        pub fn is_led_on(&self, _led: evdev::LedType) -> bool {
+            false
+        }
     }
 
     impl UInputMouseManager {
@@ -1343,6 +1581,15 @@ mod mouce {
             let fd = self.uinput_file.as_raw_fd();
             unsafe {
                 // Destroy the device, the file is closed automatically by the File module
+                ioctl(fd, UI_DEV_DESTROY as c_ulong);
+            }
+        }
+    }
+
+    impl Drop for UInputKeyboardManager {
+        fn drop(&mut self) {
+            let fd = self.uinput_file.as_raw_fd();
+            unsafe {
                 ioctl(fd, UI_DEV_DESTROY as c_ulong);
             }
         }

@@ -60,6 +60,7 @@ impl TraitCapturer for Capturer {
     }
 }
 
+#[derive(Clone)]
 pub struct Display(pub(crate) pipewire::PipeWireCapturable);
 
 impl Display {
