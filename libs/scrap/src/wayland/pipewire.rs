@@ -428,7 +428,7 @@ fn extend_with_additional_grants(capturables: &mut Vec<PipeWireCapturable>) {
     let mut extra_sessions = EXTRA_RDP_SESSION_INFO.lock().unwrap();
     while capturables.len() < compositor_display_count {
         let (conn, fd, streams, session, is_support_restore_token) =
-            match request_remote_desktop(false) {
+            match request_remote_desktop(false, None) {
                 Ok(session) => session,
                 Err(err) => {
                     warn!(
@@ -852,6 +852,11 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
 static mut INIT: bool = false;
 const RESTORE_TOKEN: &str = "restore_token";
 const RESTORE_TOKEN_CONF_KEY: &str = "wayland-restore-token";
+// Hyprland's portal grants a single monitor per session, so one restore token
+// (RESTORE_TOKEN_CONF_KEY) cannot cover a multi-monitor setup. Store a
+// per-monitor map `{ monitor_name: restore_token }` as JSON under this key so
+// each granted monitor can be restored silently after a RustDesk restart.
+const RESTORE_TOKENS_CONF_KEY: &str = "wayland-restore-tokens";
 const PIPEWIRE_DISPLAY_OFFSET_CONF_KEY: &str = "wayland-pipewire-display-offset";
 
 pub fn is_hyprland_session() -> bool {
@@ -865,12 +870,58 @@ pub fn is_hyprland_session() -> bool {
 }
 
 fn should_use_restore_token(is_support_restore_token: bool) -> bool {
-    is_support_restore_token && !is_hyprland_session()
+    // Restore tokens are now used on Hyprland too. They are stored per-monitor
+    // (see RESTORE_TOKENS_CONF_KEY) because the portal grants one monitor per
+    // session. Requires xdph with `screencopy:allow_token_by_default = true`
+    // to actually skip the picker on restore.
+    is_support_restore_token
 }
 
 fn clear_restore_token_state() {
     config::LocalConfig::set_option(RESTORE_TOKEN_CONF_KEY.to_owned(), "".to_owned());
+    config::LocalConfig::set_option(RESTORE_TOKENS_CONF_KEY.to_owned(), "".to_owned());
     config::LocalConfig::set_option(PIPEWIRE_DISPLAY_OFFSET_CONF_KEY.to_owned(), "".to_owned());
+}
+
+// Per-monitor restore token storage (Hyprland). Keyed by compositor monitor
+// name, e.g. "DP-3" / "HDMI-A-1".
+fn load_restore_tokens() -> HashMap<String, String> {
+    let raw = config::LocalConfig::get_option(RESTORE_TOKENS_CONF_KEY);
+    if raw.is_empty() {
+        return HashMap::new();
+    }
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn save_restore_token_for(monitor: &str, token: &str) {
+    if monitor.is_empty() || token.is_empty() {
+        return;
+    }
+    let mut map = load_restore_tokens();
+    if map.get(monitor).map(|t| t == token).unwrap_or(false) {
+        return;
+    }
+    map.insert(monitor.to_owned(), token.to_owned());
+    match serde_json::to_string(&map) {
+        Ok(serialized) => {
+            config::LocalConfig::set_option(RESTORE_TOKENS_CONF_KEY.to_owned(), serialized);
+        }
+        Err(err) => warn!("Failed to serialize Wayland restore tokens: {}", err),
+    }
+}
+
+// Identify which compositor monitor a freshly granted stream belongs to.
+// Hyprland per-monitor portal streams frequently report position (0, 0), so we
+// match on physical resolution instead. This is unambiguous when monitors have
+// distinct resolutions; with identical resolutions it falls back to the first
+// match and self-corrects on the next manual approval.
+fn monitor_name_for_streams(streams: &[PwStreamInfo]) -> Option<String> {
+    let (sw, sh) = streams.first()?.size;
+    get_displays()
+        .displays
+        .iter()
+        .find(|d| d.width as usize == sw && d.height as usize == sh)
+        .map(|d| d.name.clone())
 }
 
 pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
@@ -880,8 +931,13 @@ pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
 }
 
 // mostly inspired by https://gitlab.gnome.org/-/snippets/39
+//
+// `restore_token`: when set, ask the portal to restore a previously granted
+// source (per-monitor on Hyprland). `None` falls back to the legacy single
+// restore token (non-Hyprland) and otherwise prompts the user.
 pub fn request_remote_desktop(
     capture_cursor: bool,
+    restore_token: Option<String>,
 ) -> ResultType<(
     SyncConnection,
     OwnedFd,
@@ -943,6 +999,7 @@ pub fn request_remote_desktop(
             failure.clone(),
             is_support_restore_token,
             capture_cursor,
+            restore_token.clone(),
         ),
         failure_res.clone(),
     )?;
@@ -991,6 +1048,7 @@ fn on_create_session_response(
     failure: Arc<AtomicBool>,
     is_support_restore_token: bool,
     capture_cursor: bool,
+    restore_token: Option<String>,
 ) -> impl Fn(
     OrgFreedesktopPortalRequestResponse,
     &SyncConnection,
@@ -1023,8 +1081,16 @@ fn on_create_session_response(
         if is_server_running() {
             let select_sources_handle_token = "u3";
             if should_use_restore_token(is_support_restore_token) {
-                let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
-                if !restore_token.is_empty() {
+                // Prefer the explicitly requested token (per-monitor on Hyprland);
+                // otherwise fall back to the legacy single token (non-Hyprland).
+                let restore_token = restore_token
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        let t = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
+                        (!t.is_empty()).then_some(t)
+                    });
+                if let Some(restore_token) = restore_token {
                     args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
                 }
                 // persist_mode may be configured by the user.
@@ -1197,20 +1263,16 @@ fn on_start_response(
     move |r: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
         // See `is_server_running()` to understand the following code.
-        if is_server_running() {
-            if should_use_restore_token(is_support_restore_token) {
-                if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
-                    if let Some(restore_token) = restore_token.as_str() {
-                        config::LocalConfig::set_option(
-                            RESTORE_TOKEN_CONF_KEY.to_owned(),
-                            restore_token.to_owned(),
-                        );
-                    }
-                }
-            } else {
-                clear_restore_token_state();
-            }
-        }
+        // Extract the restore token before `r` is consumed below; persist it
+        // after the streams are parsed so we can key it to the granted monitor.
+        let response_restore_token = if is_server_running() {
+            r.results
+                .get(RESTORE_TOKEN)
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_owned())
+        } else {
+            None
+        };
 
         let mut response_streams = streams_from_response(r);
         debug!(
@@ -1221,6 +1283,25 @@ fn on_start_response(
                 .map(|stream| (stream.path.to_string(), stream.size, stream.position))
                 .collect::<Vec<_>>()
         );
+
+        if is_server_running() && should_use_restore_token(is_support_restore_token) {
+            if is_hyprland_session() {
+                // Hyprland: store the token per monitor so each display can be
+                // restored independently after a restart.
+                if let Some(token) = &response_restore_token {
+                    if let Some(name) = monitor_name_for_streams(&response_streams) {
+                        save_restore_token_for(&name, token);
+                    } else {
+                        warn!("Could not match granted Wayland stream to a monitor; restore token not persisted.");
+                    }
+                }
+            } else if let Some(token) = &response_restore_token {
+                config::LocalConfig::set_option(RESTORE_TOKEN_CONF_KEY.to_owned(), token.clone());
+            } else {
+                clear_restore_token_state();
+            }
+        }
+
         streams
             .clone()
             .lock()
@@ -1235,6 +1316,78 @@ fn on_start_response(
     }
 }
 
+fn new_rdp_session(
+    parts: (
+        SyncConnection,
+        OwnedFd,
+        Vec<PwStreamInfo>,
+        dbus::Path<'static>,
+        bool,
+    ),
+) -> RdpSessionInfo {
+    let (conn, fd, streams, session, is_support_restore_token) = parts;
+    RdpSessionInfo {
+        conn: Arc::new(conn),
+        streams,
+        fd,
+        session,
+        is_support_restore_token,
+        resolution: Arc::new(Mutex::new(None)),
+    }
+}
+
+// Build one capture session per compositor monitor on Hyprland. Saved
+// per-monitor restore tokens are reused so the portal can restore them without
+// a picker; monitors without a token (first-ever run, newly attached) prompt
+// once and are then remembered. Returns the primary session plus any extras.
+fn build_hyprland_sessions() -> ResultType<(RdpSessionInfo, Vec<RdpSessionInfo>)> {
+    use std::collections::HashSet;
+    let monitors = get_displays().displays.clone();
+    if monitors.is_empty() {
+        bail!("No Wayland displays to capture");
+    }
+    let saved = load_restore_tokens();
+    let mut sessions: Vec<RdpSessionInfo> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+
+    for monitor in monitors.iter() {
+        if covered.contains(&monitor.name) {
+            continue;
+        }
+        let token = saved.get(&monitor.name).cloned();
+        let parts = match request_remote_desktop(false, token) {
+            Ok(parts) => parts,
+            Err(err) => {
+                warn!(
+                    "Stopped requesting Hyprland monitor grants after {} session(s): {}",
+                    sessions.len(),
+                    err
+                );
+                break;
+            }
+        };
+        if parts.2.is_empty() {
+            warn!("Hyprland monitor grant returned no streams; stopping.");
+            break;
+        }
+        // Record the monitor we actually got (size-matched), not necessarily the
+        // one we iterated to, so a user picking out of order can't make us prompt
+        // twice for the same display.
+        let granted = monitor_name_for_streams(&parts.2).unwrap_or_else(|| monitor.name.clone());
+        covered.insert(granted);
+        sessions.push(new_rdp_session(parts));
+        if covered.len() >= monitors.len() {
+            break;
+        }
+    }
+
+    if sessions.is_empty() {
+        bail!("Failed to obtain any Hyprland capture session");
+    }
+    let primary = sessions.remove(0);
+    Ok((primary, sessions))
+}
+
 pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     let mut rdp_connection = match RDP_SESSION_INFO.lock() {
         Ok(conn) => conn,
@@ -1242,18 +1395,28 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     };
 
     if rdp_connection.is_none() {
-        let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
-        let conn = Arc::new(conn);
-
-        let rdp_info = RdpSessionInfo {
-            conn,
-            streams,
-            fd,
-            session,
-            is_support_restore_token,
-            resolution: Arc::new(Mutex::new(None)),
-        };
-        *rdp_connection = Some(rdp_info);
+        if is_server_running() && is_hyprland_session() {
+            // Hyprland grants one monitor per session. Build a session for every
+            // monitor up front (restoring saved per-monitor tokens silently where
+            // possible), so reconnects and restarts don't re-prompt.
+            match build_hyprland_sessions() {
+                Ok((primary, extras)) => {
+                    *rdp_connection = Some(primary);
+                    let mut extra = EXTRA_RDP_SESSION_INFO.lock().unwrap();
+                    extra.clear();
+                    extra.extend(extras);
+                    // All monitors are already granted; suppress the blind
+                    // extra-grant loop below.
+                    TRIED_ADDITIONAL_GRANTS.store(true, Ordering::SeqCst);
+                }
+                Err(err) => {
+                    warn!("Falling back to single Wayland portal grant: {}", err);
+                    *rdp_connection = Some(new_rdp_session(request_remote_desktop(false, None)?));
+                }
+            }
+        } else {
+            *rdp_connection = Some(new_rdp_session(request_remote_desktop(false, None)?));
+        }
     }
 
     let rdp_info = match rdp_connection.as_mut() {
@@ -1669,7 +1832,7 @@ fn fill_multi_matched_positions_cursor(
     // This creates a new remote desktop session for cursor-based position detection.
     // The session is temporary, used only for disambiguation, and is dropped after detection completes.
     let (conn, fd, streams_with_cursor, _session, _is_support_restore_token) =
-        request_remote_desktop(true)?;
+        request_remote_desktop(true, None)?;
     let conn = Arc::new(conn);
 
     let mut matched_indices = Vec::new();
