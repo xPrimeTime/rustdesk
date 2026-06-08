@@ -130,7 +130,10 @@ mod pa_impl {
                         }
                         Err(err) => {
                             if !audio_unavailable_logged {
-                                log::warn!("Audio backend unavailable, disabling audio retry spam: {}", err);
+                                log::warn!(
+                                    "Audio backend unavailable, disabling audio retry spam: {}",
+                                    err
+                                );
                                 audio_unavailable_logged = true;
                             }
                             hbb_common::sleep(1.0).await;
