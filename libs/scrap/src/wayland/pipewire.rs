@@ -35,6 +35,7 @@ use super::screencast_portal::OrgFreedesktopPortalScreenCast as screencast_porta
 lazy_static! {
     pub static ref RDP_SESSION_INFO: Mutex<Option<RdpSessionInfo>> = Mutex::new(None);
     static ref EXTRA_RDP_SESSION_INFO: Mutex<Vec<RdpSessionInfo>> = Mutex::new(Vec::new());
+    static ref PIPEWIRE_PIPELINE_START_LOCK: Mutex<()> = Mutex::new(());
 }
 
 #[derive(Serialize, Deserialize)]
@@ -481,6 +482,7 @@ pub struct PipeWireRecorder {
     crop: Option<(usize, usize, usize, usize)>,
     pix_fmt: String,
     is_cropped: bool,
+    node_id: u64,
     pipeline: gst::Pipeline,
     appsink: AppSink,
     width: usize,
@@ -490,82 +492,114 @@ pub struct PipeWireRecorder {
 
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
-        let pipeline = gst::Pipeline::new(None);
-
-        let src = gst::ElementFactory::make("pipewiresrc", None)?;
-        src.set_property("fd", &capturable.fd.as_raw_fd())?;
-        src.set_property("path", &format!("{}", capturable.path))?;
-        src.set_property("keepalive_time", &1_000.as_raw_fd())?;
-
-        // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
-        // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
-        src.set_property("always-copy", &true)?;
-
-        // COSMIC/Wayland fix: insert videoconvert between pipewiresrc and appsink.
-        // xdg-desktop-portal-cosmic's modifier negotiation fails when the downstream
-        // format set is too narrow (appsink only accepts BGRx/RGBx), producing
-        // "no more output formats" / not-negotiated (-4). videoconvert accepts any
-        // system-memory video/x-raw format, widening negotiation so the portal can
-        // settle on a format it can deliver via its SHM path.
-        let convert = gst::ElementFactory::make("videoconvert", None)?;
-
-        let sink = gst::ElementFactory::make("appsink", None)?;
-        sink.set_property("drop", &true)?;
-        sink.set_property("max-buffers", &1u32)?;
-
-        pipeline.add_many(&[&src, &convert, &sink])?;
-        src.link(&convert)?;
-        convert.link(&sink)?;
-
-        let appsink = sink
-            .dynamic_cast::<AppSink>()
-            .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
-        let mut caps = gst::Caps::new_empty();
-        caps.merge_structure(gst::structure::Structure::new(
-            "video/x-raw",
-            &[("format", &"BGRx")],
-        ));
-        caps.merge_structure(gst::structure::Structure::new(
-            "video/x-raw",
-            &[("format", &"RGBx")],
-        ));
-        appsink.set_caps(Some(&caps));
-
-        // [Workaround]
-        // Crash may occur if there are multiple pipelines started at the same time.
-        // `pipeline.get_state()` can significantly reduce the probability of crashes,
-        // but cannot completely resolve this issue.
-        // Adding a short sleep period can also reduce the probability of crashes.
-        debug!(
-            "[gstreamer] Setting pipeline {} to PLAYING state...",
-            capturable.fd.as_raw_fd()
-        );
-        pipeline.set_state(gst::State::Playing)?;
-
-        // If `is_server_running()` is false, it means using remote_desktop_portal,
-        // which does not use multiple streams, so no need to wait for state change.
-        if is_server_running() {
-            // Wait for the state change to actually complete before proceeding.
-            // The 2000ms timeout for pipeline state change was chosen based on empirical testing.
-            let state_change = pipeline.get_state(gst::ClockTime::from_mseconds(2000));
-            match state_change {
-                (Ok(_), gst::State::Playing, _) => {
-                    debug!(
-                        "[gstreamer] Pipeline {} state confirmed as PLAYING.",
-                        capturable.fd.as_raw_fd()
-                    );
-                }
-                (result, state, pending) => {
+        let node_id = capturable.path;
+        let (pipeline, appsink) = {
+            info!(
+                "[gstreamer] PipeWire node {} waiting for serialized pipeline startup",
+                node_id
+            );
+            let _startup_guard = PIPEWIRE_PIPELINE_START_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| {
                     warn!(
-                    "[gstreamer] Pipeline {} state change incomplete: result={:?}, state={:?}, pending={:?}",
-                    capturable.fd.as_raw_fd(), result, state, pending
-                );
+                        "[gstreamer] Recovering poisoned pipeline startup lock for PipeWire node {}",
+                        node_id
+                    );
+                    poisoned.into_inner()
+                });
+            info!(
+                "[gstreamer] PipeWire node {} pipeline startup begin (fd={})",
+                node_id,
+                capturable.fd.as_raw_fd()
+            );
+
+            let pipeline = gst::Pipeline::new(None);
+
+            let src = gst::ElementFactory::make("pipewiresrc", None)?;
+            src.set_property("fd", &capturable.fd.as_raw_fd())?;
+            src.set_property("path", &format!("{}", node_id))?;
+            src.set_property("keepalive_time", &1_000.as_raw_fd())?;
+
+            // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
+            // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
+            src.set_property("always-copy", &true)?;
+
+            // COSMIC/Wayland fix: insert videoconvert between pipewiresrc and appsink.
+            // xdg-desktop-portal-cosmic's modifier negotiation fails when the downstream
+            // format set is too narrow (appsink only accepts BGRx/RGBx), producing
+            // "no more output formats" / not-negotiated (-4). videoconvert accepts any
+            // system-memory video/x-raw format, widening negotiation so the portal can
+            // settle on a format it can deliver via its SHM path.
+            let convert = gst::ElementFactory::make("videoconvert", None)?;
+
+            let sink = gst::ElementFactory::make("appsink", None)?;
+            sink.set_property("drop", &true)?;
+            sink.set_property("max-buffers", &1u32)?;
+
+            pipeline.add_many(&[&src, &convert, &sink])?;
+            src.link(&convert)?;
+            convert.link(&sink)?;
+
+            let appsink = sink
+                .dynamic_cast::<AppSink>()
+                .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
+            let mut caps = gst::Caps::new_empty();
+            caps.merge_structure(gst::structure::Structure::new(
+                "video/x-raw",
+                &[("format", &"BGRx")],
+            ));
+            caps.merge_structure(gst::structure::Structure::new(
+                "video/x-raw",
+                &[("format", &"RGBx")],
+            ));
+            appsink.set_caps(Some(&caps));
+
+            // [Workaround]
+            // Crash may occur if there are multiple pipelines started at the same time.
+            // Serialize construction through PLAYING confirmation and the settling
+            // delay, while allowing already-started pipelines to capture concurrently.
+            info!(
+                "[gstreamer] PipeWire node {} requesting pipeline state PLAYING",
+                node_id
+            );
+            let set_state_result = pipeline.set_state(gst::State::Playing)?;
+            info!(
+                "[gstreamer] PipeWire node {} set_state(PLAYING) returned {:?}",
+                node_id, set_state_result
+            );
+
+            // If `is_server_running()` is false, it means using remote_desktop_portal,
+            // which does not use multiple streams, so no need to wait for state change.
+            if is_server_running() {
+                // Wait for the state change to actually complete before proceeding.
+                // The 2000ms timeout for pipeline state change was chosen based on empirical testing.
+                let state_change = pipeline.get_state(gst::ClockTime::from_mseconds(2000));
+                match state_change {
+                    (Ok(result), gst::State::Playing, pending) => {
+                        info!(
+                            "[gstreamer] PipeWire node {} reached PLAYING: result={:?}, pending={:?}",
+                            node_id, result, pending
+                        );
+                    }
+                    (result, state, pending) => {
+                        warn!(
+                            "[gstreamer] PipeWire node {} PLAYING transition incomplete: result={:?}, state={:?}, pending={:?}",
+                            node_id, result, state, pending
+                        );
+                    }
                 }
+                std::thread::sleep(std::time::Duration::from_millis(150));
             }
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
+            info!(
+                "[gstreamer] PipeWire node {} serialized pipeline startup complete",
+                node_id
+            );
+
+            (pipeline, appsink)
+        };
 
         Ok(Self {
+            node_id,
             pipeline,
             appsink,
             buffer: None,
@@ -693,11 +727,22 @@ impl Recorder for PipeWireRecorder {
 
 impl Drop for PipeWireRecorder {
     fn drop(&mut self) {
+        info!(
+            "[gstreamer] PipeWire node {} requesting pipeline state NULL",
+            self.node_id
+        );
         if let Err(err) = self.pipeline.set_state(gst::State::Null) {
-            warn!("Failed to stop GStreamer pipeline: {}.", err);
+            warn!(
+                "[gstreamer] PipeWire node {} failed to request NULL state: {}",
+                self.node_id, err
+            );
         }
         // Wait for state change to complete to avoid races during PipeWire teardown.
-        let _ = self.pipeline.get_state(gst::ClockTime::from_mseconds(2000));
+        let (result, state, pending) = self.pipeline.get_state(gst::ClockTime::from_mseconds(2000));
+        info!(
+            "[gstreamer] PipeWire node {} stopped: result={:?}, state={:?}, pending={:?}",
+            self.node_id, result, state, pending
+        );
     }
 }
 

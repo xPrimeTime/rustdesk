@@ -545,13 +545,28 @@ fn run(vs: VideoService) -> ResultType<()> {
     #[cfg(target_os = "linux")]
     let _wayland_call_on_ret = {
         // Increment active display count when starting
-        let _display_count = super::wayland::increment_active_display_count();
+        let display_count = super::wayland::increment_active_display_count();
+        let display_idx = vs.idx;
+        if !scrap::is_x11() {
+            log::info!(
+                "Wayland display {} capture starting; active display count={}",
+                display_idx,
+                display_count
+            );
+        }
 
         SimpleCallOnReturn {
             b: true,
-            f: Box::new(|| {
+            f: Box::new(move || {
                 // Decrement active display count and only clear if this was the last display
                 let remaining_count = super::wayland::decrement_active_display_count();
+                if !scrap::is_x11() {
+                    log::info!(
+                        "Wayland display {} capture stopped; active display count={}",
+                        display_idx,
+                        remaining_count
+                    );
+                }
                 if remaining_count == 0 {
                     super::wayland::clear();
                 }
@@ -567,6 +582,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     let display_idx = vs.idx;
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    #[cfg(target_os = "linux")]
+    if !scrap::is_x11() {
+        log::info!(
+            "Wayland display {} capturer ready; active display count={}",
+            display_idx,
+            super::wayland::active_display_count()
+        );
+    }
     #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
@@ -652,6 +675,8 @@ fn run(vs: VideoService) -> ResultType<()> {
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
+    #[cfg(target_os = "linux")]
+    let mut logged_first_wayland_frame = false;
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
@@ -725,6 +750,15 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    #[cfg(target_os = "linux")]
+                    if !scrap::is_x11() && !logged_first_wayland_frame {
+                        log::info!(
+                            "Wayland display {} received its first valid frame; active display count={}",
+                            display_idx,
+                            super::wayland::active_display_count()
+                        );
+                        logged_first_wayland_frame = true;
+                    }
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {

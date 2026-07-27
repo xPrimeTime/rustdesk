@@ -2869,7 +2869,11 @@ impl Connection {
                             MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
                         }
                         #[cfg(any(target_os = "macos", target_os = "linux"))]
-                        self.retina.on_mouse_event(&mut me, self.display_idx);
+                        self.retina.on_mouse_event(
+                            &mut me,
+                            self.display_idx,
+                            self.multi_ui_session,
+                        );
                         self.input_mouse(
                             me,
                             self.inner.id(),
@@ -2880,7 +2884,11 @@ impl Connection {
                         );
                     } else if self.show_my_cursor {
                         #[cfg(any(target_os = "macos", target_os = "linux"))]
-                        self.retina.on_mouse_event(&mut me, self.display_idx);
+                        self.retina.on_mouse_event(
+                            &mut me,
+                            self.display_idx,
+                            self.multi_ui_session,
+                        );
                         self.input_mouse(
                             me,
                             self.inner.id(),
@@ -4192,16 +4200,28 @@ impl Connection {
         }
     }
 
-    async fn wait_wayland_capturers_drained() {
+    async fn wait_wayland_capturers_at_most(max_active: usize) {
         #[cfg(target_os = "linux")]
         if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
             let started = Instant::now();
-            while super::wayland::active_display_count() > 0
+            while super::wayland::active_display_count() > max_active
                 && started.elapsed() < Duration::from_millis(4_000)
             {
                 time::sleep(Duration::from_millis(50)).await;
             }
+            let active = super::wayland::active_display_count();
+            if active > max_active {
+                log::warn!(
+                    "Timed out waiting for Hyprland capturers to drain to at most {}; {} remain active",
+                    max_active,
+                    active
+                );
+            }
         }
+    }
+
+    async fn wait_wayland_capturers_drained() {
+        Self::wait_wayland_capturers_at_most(0).await;
     }
 
     async fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) {
@@ -4269,9 +4289,20 @@ impl Connection {
         let video_source = self.video_source();
         if let Some(sever) = self.server.upgrade() {
             #[cfg(target_os = "linux")]
-            if !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session() {
+            let is_hyprland_wayland =
+                !scrap::is_x11() && scrap::wayland::pipewire::is_hyprland_session();
+            #[cfg(target_os = "linux")]
+            if is_hyprland_wayland && set.len() > 1 {
+                log::info!(
+                    "Starting Hyprland combined-display capture for display indices {:?}",
+                    set
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if is_hyprland_wayland && set.len() <= 1 {
                 let target = set.first().or_else(|| add.first()).copied();
                 if let Some(display) = target {
+                    let was_multi_ui_session = self.multi_ui_session;
                     let service_name = video_service::get_service_name(video_source, display);
                     {
                         let mut lock = sever.write().unwrap();
@@ -4286,7 +4317,15 @@ impl Connection {
                             true,
                         );
                     }
-                    Self::wait_wayland_capturers_drained().await;
+                    if was_multi_ui_session {
+                        // The selected pipeline is already live. Drain only the
+                        // other combined-view pipelines and keep this one running.
+                        Self::wait_wayland_capturers_at_most(1).await;
+                    } else {
+                        // Preserve the runtime-verified single-display switch:
+                        // fully drain the old pipeline before starting the new one.
+                        Self::wait_wayland_capturers_drained().await;
+                    }
                     {
                         let mut lock = sever.write().unwrap();
                         lock.capture_displays(
@@ -6448,7 +6487,7 @@ impl Retina {
     }
 
     #[inline]
-    fn on_mouse_event(&mut self, e: &mut MouseEvent, current: usize) {
+    fn on_mouse_event(&mut self, e: &mut MouseEvent, current: usize, multi_ui_session: bool) {
         let evt_type = e.mask & crate::input::MOUSE_TYPE_MASK;
         // Delta-based events do not contain absolute coordinates.
         // Avoid applying Retina coordinate scaling to them.
@@ -6458,6 +6497,15 @@ impl Retina {
         {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if multi_ui_session {
+            // Combined-view mouse coordinates are already in the compositor's
+            // global logical space, so per-monitor normalization would move
+            // them onto `current`.
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let _ = multi_ui_session;
         let Some(d) = self.displays.get(current) else {
             return;
         };
@@ -6854,7 +6902,7 @@ mod test {
             y: 510,
             ..Default::default()
         };
-        retina.on_mouse_event(&mut mouse, 0);
+        retina.on_mouse_event(&mut mouse, 0, false);
         assert_eq!(mouse.x, 260);
         assert_eq!(mouse.y, 260);
         let pos = CursorPosition {
