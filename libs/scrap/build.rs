@@ -286,6 +286,24 @@ fn main() {
     gen_vcpkg_package("libyuv", "yuv_ffi.h", "yuv_ffi.rs", ".*");
     // ffmpeg();
 
+    // hwcodec offers `h264_vaapi` as a Linux encoder, but its build script only
+    // links drm/X11/stdc++ — never libva. Upstream gets away with that because
+    // their vcpkg manifest builds ffmpeg without the `vaapi` feature, so the
+    // encoder is dead code there. Build ffmpeg as `ffmpeg[vaapi]` and the vaapi
+    // objects come in with 39 undefined `va*` symbols; a cdylib links anyway and
+    // only fails when the encoder is first used. See the commented-out `ffmpeg()`
+    // above, which lists these libs and notes "Linux require link in hwcodec".
+    // Only `va` and `va-drm` are needed: nothing references the X11 or VDPAU entry
+    // points, so linking those would add runtime deps for no gain.
+    if target_os == "linux" && std::env::var("CARGO_FEATURE_HWCODEC").is_ok() {
+        println!("cargo:rustc-link-lib=va");
+        println!("cargo:rustc-link-lib=va-drm");
+        // hwcodec links only avcodec/avutil/avformat, but those reference
+        // libswresample internally, leaving swr_* unresolved. Harmless until an
+        // audio-resampling path is hit, then it is a load/call-time failure.
+        println!("cargo:rustc-link-lib=static=swresample");
+    }
+
     if target_os == "ios" {
         // nothing
     } else if target_os == "android" {
