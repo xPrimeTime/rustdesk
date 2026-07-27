@@ -966,6 +966,37 @@ fn monitor_name_for_streams(streams: &[PwStreamInfo]) -> Option<String> {
         .map(|d| d.name.clone())
 }
 
+fn stamp_hyprland_stream_positions(streams: &mut [PwStreamInfo]) {
+    if !is_hyprland_session() {
+        return;
+    }
+
+    let displays = get_displays();
+    for stream in streams {
+        let Some(mapping_id) = stream.mapping_id.as_deref() else {
+            continue;
+        };
+        let Some(display) = displays
+            .displays
+            .iter()
+            .find(|display| display.name == mapping_id)
+        else {
+            warn!(
+                "Wayland stream mapping_id {:?} did not match a compositor monitor; keeping portal position {:?}.",
+                mapping_id, stream.position
+            );
+            continue;
+        };
+
+        let portal_position = stream.position;
+        stream.position = (display.x, display.y);
+        info!(
+            "Stamped Hyprland stream node={} mapping_id={:?} position {:?} from compositor layout (portal position {:?}).",
+            stream.path, mapping_id, stream.position, portal_position
+        );
+    }
+}
+
 pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
     let conn = SyncConnection::new_session()?;
     let portal = get_portal(&conn);
@@ -1337,6 +1368,7 @@ fn on_start_response(
                 stream.path, stream.mapping_id, stream.size, stream.position
             );
         }
+        stamp_hyprland_stream_positions(&mut response_streams);
         debug!(
             "Portal start response returned {} stream(s): {:?}",
             response_streams.len(),
