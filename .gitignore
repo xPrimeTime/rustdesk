@@ -56,3 +56,6 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+
+# Local-only Wayland/Hyprland working notes (not for the repo)
+WAYLAND_HANDOFF.md
