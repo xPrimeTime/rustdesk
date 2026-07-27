@@ -1270,6 +1270,7 @@ fn get_envs<'a>(
     let mut best = empty.clone();
     let mut best_count = 0usize;
     let mut best_mask: u64 = 0;
+    let mut best_source: Option<(String, String)> = None;
 
     // Iterate /proc to find matching processes
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1344,6 +1345,14 @@ fn get_envs<'a>(
                     }
 
                     if found_count == names.len() {
+                        let executable =
+                            cmdline_str.split_whitespace().next().unwrap_or("<unknown>");
+                        log::info!(
+                            "Desktop environment populated from /proc/{} candidate {} (all {} requested variables).",
+                            pid_str,
+                            executable,
+                            found_count
+                        );
                         return found;
                     }
                 }
@@ -1354,7 +1363,25 @@ fn get_envs<'a>(
             best = found;
             best_count = found_count;
             best_mask = found_mask;
+            best_source = Some((
+                pid_str.to_owned(),
+                cmdline_str
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("<unknown>")
+                    .to_owned(),
+            ));
         }
+    }
+
+    if let Some((pid, executable)) = best_source {
+        log::info!(
+            "Desktop environment populated from /proc/{} candidate {} ({}/{} requested variables).",
+            pid,
+            executable,
+            best_count,
+            names.len()
+        );
     }
 
     best
@@ -1754,10 +1781,14 @@ mod desktop {
         }
 
         fn ensure_wayland_session_env(&mut self) {
+            let needs_hyprland_signature = self
+                .current_desktop
+                .to_ascii_lowercase()
+                .contains("hyprland");
             if !self.wl_display.is_empty()
                 && !self.dbus.is_empty()
                 && !self.current_desktop.is_empty()
-                && !self.hyprland_instance_signature.is_empty()
+                && (!needs_hyprland_signature || !self.hyprland_instance_signature.is_empty())
             {
                 return;
             }
@@ -1787,10 +1818,22 @@ mod desktop {
                     tray.as_str(),
                 ];
                 for proc in display_proc {
-                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
-                    self.xauth = get_env(ENV_KEY_XAUTHORITY, &self.uid, proc);
-                    self.wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
-                    self.dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
+                    let display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
+                    if !display.is_empty() {
+                        self.display = display;
+                    }
+                    let xauth = get_env(ENV_KEY_XAUTHORITY, &self.uid, proc);
+                    if !xauth.is_empty() {
+                        self.xauth = xauth;
+                    }
+                    let wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
+                    if !wl_display.is_empty() {
+                        self.wl_display = wl_display;
+                    }
+                    let dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
+                    if !dbus.is_empty() {
+                        self.dbus = dbus;
+                    }
                     if !self.display.is_empty() && !self.xauth.is_empty() {
                         if self.is_wayland() {
                             self.ensure_wayland_session_env();
@@ -1999,12 +2042,13 @@ mod desktop {
 
         pub fn refresh(&mut self) {
             if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
-                // Xwayland display and xauth may not be available in a short time after login.
-                if is_xwayland_running() && !self.is_login_wayland() {
+                if self.is_wayland() {
+                    self.ensure_wayland_session_env();
+                    self.is_rustdesk_subprocess = false;
+                } else if is_xwayland_running() && !self.is_login_wayland() {
+                    // Xwayland display and xauth may not be available in a short time after login.
                     self.get_display_xauth_xwayland();
                     self.is_rustdesk_subprocess = false;
-                } else if self.is_wayland() {
-                    self.get_display_xauth_wayland();
                 }
                 return;
             }
@@ -2037,11 +2081,7 @@ mod desktop {
 
             self.get_home();
             if self.is_wayland() {
-                if is_xwayland_running() {
-                    self.get_display_xauth_xwayland();
-                } else {
-                    self.get_display_xauth_wayland();
-                }
+                self.ensure_wayland_session_env();
                 self.is_rustdesk_subprocess = false;
             } else {
                 self.get_display_x11();
