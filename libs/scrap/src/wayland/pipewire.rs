@@ -1508,54 +1508,67 @@ fn build_hyprland_sessions() -> ResultType<(RdpSessionInfo, Vec<RdpSessionInfo>)
     let mut sessions: Vec<RdpSessionInfo> = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
 
-    'monitors: for monitor in monitors.iter() {
-        if covered.contains(&monitor.name) {
+    // Drive the loop off which monitors are still missing, not off the monitor
+    // list itself. The portal decides which monitor it hands back, so a grant
+    // that does not match the request must not consume that monitor's turn --
+    // otherwise picking out of order (or a stale token restoring the wrong
+    // output) leaves a monitor with no session at all.
+    let mut token_tried: HashSet<String> = HashSet::new();
+    let max_attempts = monitors.len() * MAX_GRANT_ATTEMPTS_PER_MONITOR;
+
+    for attempt in 1..=max_attempts {
+        let Some(requested) = monitors.iter().find(|m| !covered.contains(&m.name)) else {
+            break;
+        };
+        let requested_name = requested.name.clone();
+        // Offer a saved token only once per monitor. A stale token that restores
+        // some other output would otherwise be replayed on every attempt.
+        let token = if token_tried.insert(requested_name.clone()) {
+            saved.get(&requested_name).cloned()
+        } else {
+            None
+        };
+
+        let parts = match request_remote_desktop(false, token) {
+            Ok(parts) => parts,
+            Err(err) => {
+                warn!(
+                    "Stopped requesting Hyprland monitor grants after {} session(s): {}",
+                    sessions.len(),
+                    err
+                );
+                break;
+            }
+        };
+        if parts.2.is_empty() {
+            warn!("Hyprland monitor grant returned no streams; stopping.");
+            break;
+        }
+
+        // Record the monitor the portal actually granted, which need not be the
+        // one requested.
+        let granted =
+            monitor_name_for_streams(&parts.2).unwrap_or_else(|| requested_name.clone());
+        if !covered.insert(granted.clone()) {
+            warn!(
+                "Hyprland portal returned already-covered monitor {} while requesting {}; duplicate grant discarded (attempt {}/{}).",
+                granted, requested_name, attempt, max_attempts
+            );
+            if let Err(err) = close_portal_session(&parts.0, parts.3.clone()) {
+                warn!(
+                    "Failed to close duplicate Hyprland portal session {:?}: {}",
+                    parts.3, err
+                );
+            }
             continue;
         }
-        let mut token = saved.get(&monitor.name).cloned();
-        for attempt in 1..=MAX_GRANT_ATTEMPTS_PER_MONITOR {
-            let parts = match request_remote_desktop(false, token.take()) {
-                Ok(parts) => parts,
-                Err(err) => {
-                    warn!(
-                        "Stopped requesting Hyprland monitor grants after {} session(s): {}",
-                        sessions.len(),
-                        err
-                    );
-                    break 'monitors;
-                }
-            };
-            if parts.2.is_empty() {
-                warn!("Hyprland monitor grant returned no streams; stopping.");
-                break 'monitors;
-            }
-            // Record the monitor actually granted by the portal. A duplicate
-            // grant is explicitly closed and retried once without a token, so
-            // a stale token cannot create a duplicate display entry.
-            let granted =
-                monitor_name_for_streams(&parts.2).unwrap_or_else(|| monitor.name.clone());
-            if !covered.insert(granted.clone()) {
-                warn!(
-                    "Hyprland portal returned already-covered monitor {} while requesting {}; duplicate grant {}/{} discarded.",
-                    granted,
-                    monitor.name,
-                    attempt,
-                    MAX_GRANT_ATTEMPTS_PER_MONITOR
-                );
-                if let Err(err) = close_portal_session(&parts.0, parts.3.clone()) {
-                    warn!(
-                        "Failed to close duplicate Hyprland portal session {:?}: {}",
-                        parts.3, err
-                    );
-                }
-                continue;
-            }
-            sessions.push(new_rdp_session(parts));
-            break;
+        if granted != requested_name {
+            info!(
+                "Hyprland portal granted {} while {} was requested; keeping it and requesting the remainder.",
+                granted, requested_name
+            );
         }
-        if covered.len() >= monitors.len() {
-            break;
-        }
+        sessions.push(new_rdp_session(parts));
     }
 
     let uncovered = monitors
@@ -1634,7 +1647,9 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
         }
     }
 
-    extend_with_additional_grants(&mut capturables);
+    // No `extend_with_additional_grants()` here: it returns immediately unless
+    // `is_hyprland_session()`, and the Hyprland path already returned above, so
+    // the call could never do any work.
     log_capturables("Final Wayland capturables", &capturables);
 
     Ok(capturables)
