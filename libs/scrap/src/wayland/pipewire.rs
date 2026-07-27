@@ -70,13 +70,29 @@ impl PipewireDisplayOffsetCache {
     }
 }
 
-#[inline]
-pub fn close_session() {
-    let _ = RDP_SESSION_INFO.lock().unwrap().take();
+// Shared teardown for both close paths. Callers must already hold, or not want,
+// the RDP_SESSION_INFO lock: the lock order everywhere is RDP_SESSION_INFO then
+// EXTRA_RDP_SESSION_INFO, and this keeps to it.
+//
+// Note we do NOT call `close_portal_session()` on the sessions being discarded
+// here, unlike the duplicate-grant path in `build_hyprland_sessions()`. That is
+// deliberate rather than an oversight: there we discard one grant and
+// immediately request another for the same output, so the close has to be
+// prompt and ordered before the next request. Here the whole connection is
+// dropped and nothing re-requests, which is how upstream has always torn these
+// down. Closing explicitly would add up to a 5s D-Bus timeout per session on
+// the disconnect path for no observed benefit.
+fn reset_session_state() {
     EXTRA_RDP_SESSION_INFO.lock().unwrap().clear();
     clear_wayland_displays_cache();
     HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
     TRIED_ADDITIONAL_GRANTS.store(false, Ordering::SeqCst);
+}
+
+#[inline]
+pub fn close_session() {
+    let _ = RDP_SESSION_INFO.lock().unwrap().take();
+    reset_session_state();
 }
 
 #[inline]
@@ -95,10 +111,7 @@ pub fn try_close_session() {
     }
     if close {
         *rdp_info = None;
-        EXTRA_RDP_SESSION_INFO.lock().unwrap().clear();
-        clear_wayland_displays_cache();
-        HAS_POSITION_ATTR.store(false, Ordering::SeqCst);
-        TRIED_ADDITIONAL_GRANTS.store(false, Ordering::SeqCst);
+        reset_session_state();
     }
 }
 
@@ -422,30 +435,22 @@ fn extend_with_additional_grants(capturables: &mut Vec<PipeWireCapturable>) {
 
     let mut extra_sessions = EXTRA_RDP_SESSION_INFO.lock().unwrap();
     while capturables.len() < compositor_display_count {
-        let (conn, fd, streams, session, is_support_restore_token) =
-            match request_remote_desktop(false, None) {
-                Ok(session) => session,
-                Err(err) => {
-                    warn!(
-                        "Stopped requesting additional Wayland display grants: {}",
-                        err
-                    );
-                    break;
-                }
-            };
-        if streams.is_empty() {
+        let parts = match request_remote_desktop(false, None) {
+            Ok(session) => session,
+            Err(err) => {
+                warn!(
+                    "Stopped requesting additional Wayland display grants: {}",
+                    err
+                );
+                break;
+            }
+        };
+        if parts.2.is_empty() {
             warn!("Additional Wayland display grant returned no streams.");
             break;
         }
 
-        let rdp_info = RdpSessionInfo {
-            conn: Arc::new(conn),
-            streams,
-            fd,
-            session,
-            is_support_restore_token,
-            resolution: Arc::new(Mutex::new(None)),
-        };
+        let rdp_info = new_rdp_session(parts);
         let extra_capturables = capturables_from_session(&rdp_info);
         log_capturables("Additional Wayland portal grant", &extra_capturables);
         capturables.extend(extra_capturables);
