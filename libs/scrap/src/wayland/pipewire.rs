@@ -1447,7 +1447,13 @@ fn on_start_response(
             } else if let Some(token) = &response_restore_token {
                 config::LocalConfig::set_option(RESTORE_TOKEN_CONF_KEY.to_owned(), token.clone());
             } else {
-                clear_restore_token_state();
+                // Do NOT clear the stored token here. A `Start` response can come
+                // back without one for reasons that leave the saved token
+                // perfectly valid (portal declined to re-issue, screen locked so
+                // mutter refused the restore). Wiping it turns a one-off failure
+                // into a permanent re-prompt on GNOME/KDE. Keep what we have and
+                // let the next successful Start rotate it.
+                debug!("Portal start response carried no restore token; keeping the stored one.");
             }
         }
 
