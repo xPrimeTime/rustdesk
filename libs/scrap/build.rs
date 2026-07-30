@@ -191,8 +191,36 @@ fn fix_opaque_codec_structs(ffi_rs: &Path) {
         ),
     ];
 
+    // `cfg_options` needs care that the other five entries do not. Each of those
+    // keys off one of bindgen's opaque `pub _address: u8` placeholders, so it is
+    // self-guarding: no placeholder, no substitution. `cfg_options` has no
+    // placeholder to key off because it does not match the aom allowlist regex
+    // (`^(aom|AOM|OBU|AV1).*`), so its entry is anchored on the
+    // `aom_enc_frame_flags_t` typedef, which is always present. What bindgen does
+    // with the type then depends on which aom headers it is pointed at, and all
+    // three outcomes occur in practice:
+    //
+    //   1. an opaque `cfg_options` — drop it here so the anchored injection below
+    //      supplies the real fields; leaving it would make
+    //      `aom_codec_enc_cfg.encoder_cfg` zero-sized and silently wrong.
+    //   2. a complete `cfg_options` (what CI's aom produces) — skip the injection,
+    //      or the file gets two definitions and fails with E0428/E0119/E0204.
+    //   3. nothing at all (what our vcpkg aom produces) — inject it.
+    const CFG_OPTIONS_OPAQUE: &str =
+        "#[repr(C)]\n#[derive(Debug, Copy, Clone)]\npub struct cfg_options {\n    pub _address: u8,\n}\n";
+    content = content.replace(CFG_OPTIONS_OPAQUE, "");
+
     for (from, to) in replacements {
+        if to.contains("pub struct cfg_options {") && content.contains("pub struct cfg_options {") {
+            continue; // case 2
+        }
         content = content.replace(from, to);
+    }
+
+    // And the alias on its own, for a bindgen/aom pairing that emits the struct
+    // without it. Item order does not matter in Rust, so appending is fine.
+    if content.contains("pub struct cfg_options {") && !content.contains("pub type cfg_options_t") {
+        content.push_str("pub type cfg_options_t = cfg_options;\n");
     }
 
     let _ = fs::write(ffi_rs, content);
